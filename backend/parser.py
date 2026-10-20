@@ -77,7 +77,7 @@ class Parser:
         if p[0]=="*=":
             self.advance(); e=self.expr(); return ("assign",name,("bin","*",("var",name),e))
         if p[0]=="++":
-            self.advance(); return ("assign",name,("bin","+","var",name) if False else ("assign",name,("bin","+",("var",name),("num",1))))
+            self.advance(); return ("assign",name,("bin","+",("var",name),("num",1)))
         if p[0]=="--":
             self.advance(); return ("assign",name,("bin","-",("var",name),("num",1)))
         raise ParseError(p[2],"expected assignment operator")

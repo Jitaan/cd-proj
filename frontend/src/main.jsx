@@ -15,8 +15,8 @@ function Card({ title, children }) {
 function App() {
   const [examples, setExamples] = useState({});
   const [source, setSource] = useState("");
-  const [mode, setMode] = useState("ai");
-  const [lang, setLang] = useState("mini");
+  const mode = "ai";
+  const [lang, setLang] = useState("c");
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
 
@@ -39,11 +39,9 @@ function App() {
     <div className="min-h-screen bg-slate-950 text-slate-100">
       <main className="mx-auto max-w-4xl px-4 py-10 sm:px-6 sm:py-16">
         <header className="mb-10 text-center">
-          <div className="mb-4 inline-flex items-center gap-2 rounded-full border border-indigo-900/80 bg-indigo-950/70 px-3 py-1 text-xs font-semibold uppercase tracking-wider text-indigo-300">
-            Compiler playground
-          </div>
+          
           <h1 className="bg-gradient-to-r from-indigo-300 via-violet-300 to-fuchsia-300 bg-clip-text text-4xl font-extrabold text-transparent sm:text-5xl">
-            MiniC TAC Optimizer
+            AI-Assisted Intermediate Code Optimization
           </h1>
           <p className="mt-3 text-slate-400">AI-assisted three-address code optimization</p>
         </header>
@@ -57,13 +55,9 @@ function App() {
                   {Object.keys(examples).map(k => <option key={k} value={k}>{k}</option>)}
                 </select>
                 <select aria-label="Language" className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm text-slate-200 outline-none transition focus:border-indigo-400 focus:ring-4 focus:ring-indigo-950" value={lang} onChange={(e) => setLang(e.target.value)}>
-                <option value="mini">MiniC</option>
                 <option value="c">C</option>
+                <option value="mini">MiniC</option>
               </select>
-              <select aria-label="Optimization mode" className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm text-slate-200 outline-none transition focus:border-indigo-400 focus:ring-4 focus:ring-indigo-950" value={mode} onChange={(e) => setMode(e.target.value)}>
-                  <option value="ai">AI recommended</option>
-                  <option value="none">None</option>
-                </select>
               </div>
               <textarea aria-label="MiniC source code" value={source} onChange={(e) => setSource(e.target.value)} rows={16} placeholder="Write or select a MiniC program to optimize..."
                 className="w-full resize-y rounded-xl border border-slate-700 bg-black p-4 font-mono text-sm leading-6 text-slate-100 outline-none placeholder:text-slate-600 transition focus:border-indigo-400 focus:ring-4 focus:ring-indigo-950" />

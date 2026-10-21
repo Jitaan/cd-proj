@@ -1,4 +1,4 @@
 int main() {
   int x = 2*3+4;
-  print(x);
+  printf("%d\n", x);
 }

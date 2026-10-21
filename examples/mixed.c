@@ -13,5 +13,5 @@ int main() {
   for (i = 0; i < 3; i++) {
     c += i;
   }
-  print(c);
+  printf("%d\n", c);
 }

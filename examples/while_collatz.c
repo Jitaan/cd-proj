@@ -9,5 +9,5 @@ int main() {
     }
     steps++;
   }
-  print(steps);
+  printf("%d\n", steps);
 }

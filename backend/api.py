@@ -50,7 +50,7 @@ class Handler(BaseHTTPRequestHandler):
             src = payload.get("source", "")
             mode = payload.get("mode", "ai")
             passes = payload.get("passes")
-            lang = payload.get("lang", "mini")
+            lang = payload.get("lang", "c")
             self._json(service.run_pipeline(src, mode=mode, passes=passes, lang=lang))
         elif self.path == "/api/compare":
             src = payload.get("source", "")

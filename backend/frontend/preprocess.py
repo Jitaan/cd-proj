@@ -1,6 +1,12 @@
 ﻿# frontend/preprocess.py - minimal preprocessor (C1)
 import re
 
+class PreprocessError(Exception):
+    def __init__(self, line, msg):
+        self.line = line
+        self.msg = msg
+        super().__init__("%d: %s" % (line, msg))
+
 BUILTIN = {
     "INT_MAX": "2147483647", "INT_MIN": "-2147483648", "UINT_MAX": "4294967295",
     "LONG_MAX": "9223372036854775807", "LONG_MIN": "-9223372036854775808",
@@ -16,7 +22,7 @@ def preprocess(src):
     lines = src.split("\n")
     macros = dict(BUILTIN)
     result_lines = []
-    for line in lines:
+    for line_num, line in enumerate(lines, 1):
         stripped = line.strip()
         if stripped.startswith("#include"):
             result_lines.append("")  # blank line preserve number
@@ -34,7 +40,7 @@ def preprocess(src):
             result_lines.append("")
             continue
         if stripped.startswith("#"):
-            raise ValueError("unsupported directive: %s" % stripped)
+            raise PreprocessError(line_num, "unsupported directive: %s" % stripped)
         # macro expansion (object-like, simple)
         for name, val in macros.items():
             line = re.sub(r"\b" + re.escape(name) + r"\b", val, line)

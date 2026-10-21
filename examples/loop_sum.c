@@ -4,5 +4,5 @@ int main() {
   for (i = 1; i <= 10; i++) {
     s += i;
   }
-  print(s);
+  printf("%d\n", s);
 }

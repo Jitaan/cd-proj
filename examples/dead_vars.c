@@ -3,5 +3,5 @@ int main() {
   int b = 2;
   int c = a + b;
   int d = c * 2;
-  print(a);
+  printf("%d\n", a);
 }

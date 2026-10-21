@@ -137,14 +137,48 @@ def recommend(instrs):
         preds[pname] = pred
         if pred == 1:
             passes.add(pname)
-    # include enablers: fold needs dce; cse needs fold+dce
+    # include enablers for all passes
     if "cse" in passes:
         passes.add("fold")
         passes.add("dce")
         passes.add("cfg")
+        passes.add("copy_prop")
+    if "dag" in passes:
+        passes.add("fold")
+        passes.add("cse")
+        passes.add("dce")
+    if "licm" in passes:
+        passes.add("fold")
+        passes.add("dce")
+        passes.add("cfg")
+    if "strength_red" in passes:
+        passes.add("alg")
+        passes.add("dce")
+    if "iv_elim" in passes:
+        passes.add("licm")
+        passes.add("strength_red")
+        passes.add("dce")
+    if "loop_unroll" in passes:
+        passes.add("iv_elim")
+        passes.add("licm")
+        passes.add("dce")
+    if "loop_fuse" in passes:
+        passes.add("licm")
+        passes.add("dce")
     if "alg" in passes:
         passes.add("cfg")
+    if "cfg" in passes:
+        passes.add("cond_jump")
     if "fold" in passes:
+        passes.add("dce")
+        passes.add("cond_jump")
+    if "copy_prop" in passes:
+        passes.add("dce")
+        passes.add("cond_jump")
+        passes.add("dce")
+    if "fold" in passes:
+        passes.add("dce")
+    if "copy_prop" in passes:
         passes.add("dce")
     explanation = {
         "features": dict(zip(names, feats)),

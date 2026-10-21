@@ -12,7 +12,7 @@ def split_blocks(instrs):
     for i, ins in enumerate(instrs):
         if ins.op == "label":
             leaders.add(i)
-        if i > 0 and instrs[i - 1].op in ("goto", "ifFalse"):
+        if i > 0 and instrs[i - 1].op in ("goto", "ifFalse", "if"):
             leaders.add(i)
     leaders = sorted(leaders)
     blocks = []
@@ -52,9 +52,11 @@ def successors(blocks, i=None):
     if last.op == "goto":
         j = _label_to_index(blocks, last.a)
         return [j] if j is not None else []
-    if last.op == "ifFalse":
+    if last.op in ("ifFalse", "if"):
+        # Both ifFalse and if have target in arg2/result
+        target = last.b if last.op == "ifFalse" else last.result
         res = []
-        j = _label_to_index(blocks, last.b)
+        j = _label_to_index(blocks, target)
         if j is not None:
             res.append(j)
         if i + 1 < len(blocks):

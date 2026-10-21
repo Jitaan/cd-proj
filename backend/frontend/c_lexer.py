@@ -73,7 +73,7 @@ def lex_c(src):
             while i < n and (src[i].isalnum() or src[i] == "_"):
                 i += 1
             word = src[start:i]
-            if re.fullmatch(r"_t\d+", word):
+            if re.fullmatch(r"t\d+", word):
                 raise CLexError(line, col, "reserved identifier %s" % word)
             if word in KEYWORDS:
                 tokens.append(CToken("KEYWORD", word, line, col))
@@ -134,13 +134,23 @@ def lex_c(src):
         # string literal
         if c == '"':
             j = i + 1
+            chars = ""
             while j < n and src[j] != '"':
                 if src[j] == "\\":
-                    j += 2
+                    if j + 1 < n:
+                        esc_char = src[j+1]
+                        esc_map = {"n":"\n","t":"\t","r":"\r","0":"\0","\\":"\\",'"':'"'}
+                        chars += esc_map.get(esc_char, esc_char)
+                        j += 2
+                    else:
+                        chars += "\\"
+                        j += 1
                 else:
+                    chars += src[j]
                     j += 1
-            tokens.append(CToken("STRING_LIT", src[i:j+1], line, col))
-            i = j + 1; col += (j - i + 2)
+            # Store the processed string with quotes
+            tokens.append(CToken("STRING_LIT", '"' + chars + '"', line, col))
+            i = j + 1; col += (j - i + 1)
             continue
         raise CLexError(line, col, "unexpected character %r" % c)
     tokens.append(CToken("EOF", None, line, col))

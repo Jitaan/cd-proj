@@ -11,12 +11,24 @@ def branch(instrs):
     out = []
     n = 0
     for ins in instrs:
-        if ins.op == "ifFalse" and isinstance(ins.a, (int, float)) and not isinstance(ins.a, bool):
-            if ins.a == 0:
-                out.append(tac.Instr("goto", ins.b, None, None))
+        if ins.op == "ifFalse" and isinstance(ins.arg1, (int, float)) and not isinstance(ins.arg1, bool):
+            if ins.arg1 == 0:
+                out.append(tac.Instr("goto", ins.arg2, None, None))
                 n += 1
             else:
                 n += 1
+                continue
+        elif ins.op == "if" and isinstance(ins.arg1, int) and isinstance(ins.arg2, int):
+            # if x relop y goto L with constant operands
+            res = tac.eval_op(ins.op_relop, ins.arg1, ins.arg2)
+            if res is not None:
+                if res == 0:
+                    # Always false - fall through (remove instruction)
+                    n += 1
+                else:
+                    # Always true - replace with goto
+                    out.append(tac.Instr("goto", ins.result, None, None))
+                    n += 1
                 continue
         else:
             out.append(ins)
@@ -56,7 +68,7 @@ def peep(instrs):
                 j = i + 1
                 found = False
                 while j < n and cur[j].op == "label":
-                    if cur[j].a == cur[i].a:
+                    if cur[j].arg1 == cur[i].arg1:
                         found = True
                     j += 1
                 if found:
@@ -70,7 +82,7 @@ def peep(instrs):
         # rule 2: self-copy
         out2 = []
         for ins in cur:
-            if ins.op == "copy" and ins.a == ins.dst:
+            if ins.op == "copy" and ins.arg1 == ins.result:
                 total += 1
                 changed = True
                 continue
@@ -79,11 +91,16 @@ def peep(instrs):
         # rule 3: unreferenced labels
         refs = set()
         for ins in cur:
-            if ins.op in ("goto", "ifFalse"):
-                refs.add(ins.a if ins.op == "goto" else ins.b)
+            if ins.op in ("goto", "ifFalse", "if"):
+                if ins.op == "goto":
+                    refs.add(ins.arg1)
+                elif ins.op == "ifFalse":
+                    refs.add(ins.arg2)
+                elif ins.op == "if":
+                    refs.add(ins.result)
         out3 = []
         for ins in cur:
-            if ins.op == "label" and ins.a not in refs:
+            if ins.op == "label" and ins.arg1 not in refs:
                 total += 1
                 changed = True
                 continue

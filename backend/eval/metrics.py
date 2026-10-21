@@ -37,7 +37,7 @@ def compute_metrics(target, inputs=None):
             dynamic_count = 0
     return {"static_count": static_count, "weighted_cost": weighted_cost,
             "dynamic_count": dynamic_count, "dynamic_cost": dyn_cost,
-            "temp_count": len(set(i.result for i in instrs if i.result and i.result.startswith("_t")))}
+            "temp_count": len(set(i.result for i in instrs if i.result and i.result.startswith("t") and i.result[1:].isdigit()))}
 
 def reduction_percent(before, after):
     if before == 0: return 0.0

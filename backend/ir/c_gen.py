@@ -2,9 +2,18 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend"))
-from ir.tac import Instr
+from tac import Instr
 from ir.program import Program, Function
 from frontend.c_types import CType
+
+def _skip_loc(node):
+    """If last element is a (line, col) tuple, return node without it."""
+    if isinstance(node, tuple) and len(node) > 0:
+        last = node[-1]
+        if isinstance(last, tuple) and len(last) == 2 and all(isinstance(x, int) for x in last):
+            return node[:-1]
+    return node
+
 
 class CGenerator:
     def __init__(self):
@@ -14,7 +23,7 @@ class CGenerator:
 
     def new_temp(self):
         self.temp_n += 1
-        return "_t%d" % self.temp_n
+        return "t%d" % self.temp_n
 
     def new_label(self):
         self.label_n += 1
@@ -31,6 +40,7 @@ class CGenerator:
     def generate(self, tu):
         prog = Program()
         for decl in tu[1]:
+            decl = _skip_loc(decl)
             if decl[0] == "FuncDef":
                 fn = self.gen_func(decl)
                 prog.functions[fn.name] = fn
@@ -49,6 +59,7 @@ class CGenerator:
         return prog
 
     def gen_func(self, node):
+        node = _skip_loc(node)
         ret_ty = node[1]
         ret_tag = self.gen_type_tag(ret_ty) if not isinstance(ret_ty, str) else ret_ty
         if isinstance(ret_ty, tuple):
@@ -60,7 +71,9 @@ class CGenerator:
         fn = Function(name=name, params=[], ret_ty=ret_tag, body=[], var_types={})
         self.var_types = fn.var_types
         # params
-        for (uniq, pty) in params:
+        for p in params:
+            p = _skip_loc(p)
+            uniq, pty = p[0], p[1]
             ptag = self.gen_type_tag(pty)
             fn.params.append((uniq, ptag))
             fn.var_types[uniq] = ptag
@@ -72,13 +85,50 @@ class CGenerator:
         return fn
 
     def gen_block(self, node, fn):
+        node = _skip_loc(node)
         if node[0] == "Block":
             for s in node[1]:
                 self.gen_stmt(s, fn)
         else:
             self.gen_stmt(node, fn)
 
+    def _gen_cond_jump(self, cond_node, target_label, fn):
+        """Generate proper conditional jump: if x relop y goto L"""
+        cond_node = _skip_loc(cond_node)
+        if cond_node[0] == "BinOp" and cond_node[1] in ("<", ">", "<=", ">=", "==", "!="):
+            op = cond_node[1]
+            left_node = cond_node[2]
+            right_node = cond_node[3]
+            left_addr, left_type = self.gen_expr(left_node, fn)
+            right_addr, right_type = self.gen_expr(right_node, fn)
+            # Cast to common type if needed
+            from frontend.c_types import common_type, CType
+            def to_ct(ty):
+                if isinstance(ty, CType): return ty
+                if isinstance(ty, str):
+                    bits = int(ty[1:]) if ty[1:].isdigit() else 32
+                    return CType(bits, ty.startswith("i"))
+                return CType(32, True)
+            ct = common_type(to_ct(left_type), to_ct(right_type))
+            ctag = ct.tag
+            if left_type != ctag:
+                tmp = self.new_temp(); fn.var_types[tmp] = ctag
+                fn.body.append(Instr("cast", left_addr, None, tmp, ty=ctag)); left_addr = tmp
+            if right_type != ctag:
+                tmp = self.new_temp(); fn.var_types[tmp] = ctag
+                fn.body.append(Instr("cast", right_addr, None, tmp, ty=ctag)); right_addr = tmp
+            # Generate proper conditional jump: if left op right goto target
+            fn.body.append(Instr("if", left_addr, right_addr, target_label, op_relop=op, ty=ctag))
+            return
+        elif cond_node[0] == "BinOp" and cond_node[1] in ("&&", "||"):
+            # Logical ops - fall back to ifFalse for now
+            pass
+        # Fall back to ifFalse for complex conditions
+        cond_addr, cond_type = self.gen_expr(cond_node, fn)
+        fn.body.append(Instr("ifFalse", cond_addr, target_label, None))
+
     def gen_stmt(self, node, fn):
+        node = _skip_loc(node)
         kind = node[0]
         if kind == "VarDecl":
             ty = node[1]
@@ -97,7 +147,7 @@ class CGenerator:
                     addr = tmp
                 fn.body.append(Instr("copy", addr, None, name, ty=tag))
         elif kind == "ExprStmt":
-            e = node[1]
+            e = _skip_loc(node[1])
             if e[0] == "Assign":
                 op = e[1]; name = e[2]; expr = e[3]
                 addr, t = self.gen_expr(expr, fn)
@@ -110,7 +160,6 @@ class CGenerator:
                 if op == "=":
                     fn.body.append(Instr("copy", addr, None, name, ty=vtag))
                 elif op == "+=":
-                    # t = name + expr
                     tmp = self.new_temp()
                     fn.var_types[tmp] = vtag
                     fn.body.append(Instr("+", name, addr, tmp, ty=vtag))
@@ -129,13 +178,11 @@ class CGenerator:
                 op = e[1]; prefix = e[2]; name = e[3]
                 vtag = fn.var_types.get(name, "i32")
                 if prefix:
-                    # ++x: x = x + 1; result x
                     tmp = self.new_temp()
                     fn.var_types[tmp] = vtag
                     fn.body.append(Instr("+", name, 1, tmp, ty=vtag))
                     fn.body.append(Instr("copy", tmp, None, name, ty=vtag))
                 else:
-                    # x++: old = x; x = x+1
                     old = self.new_temp()
                     fn.var_types[old] = vtag
                     fn.body.append(Instr("copy", name, None, old, ty=vtag))
@@ -146,45 +193,69 @@ class CGenerator:
             else:
                 addr, t = self.gen_expr(e, fn)
         elif kind == "If":
-            cond, ct = self.gen_expr(node[1], fn)
-            then_b = self.new_label()
-            else_b = self.new_label()
-            end_b = self.new_label()
-            fn.body.append(Instr("ifFalse", cond, else_b if node[3] else end_b, None))
+            cond_node = node[1]
+            then_b = self.new_label()  # L1 - true block
+            else_b = self.new_label()  # L2 - false block
+            end_b = self.new_label()   # L3 - continuation
+            # node structure: ("If", cond, then, else?, loc?)
+            else_node = None
+            for i in range(3, len(node)):
+                n = _skip_loc(node[i]) if isinstance(node[i], tuple) else node[i]
+                if n is not None:
+                    else_node = n
+                    break
+            # Generate conditional jump: if condition goto then_b (jump to true block)
+            self._gen_cond_jump(cond_node, then_b, fn)
+            # If false, fall through to else block
+            fn.body.append(Instr("goto", else_b, None, None))
+            # True block (L1)
+            fn.body.append(Instr("label", then_b, None, None))
             self.gen_stmt(node[2], fn)
-            if node[3]:
+            if else_node:
+                # Skip false block after true block
                 fn.body.append(Instr("goto", end_b, None, None))
+                # False block (L2)
                 fn.body.append(Instr("label", else_b, None, None))
-                self.gen_stmt(node[3], fn)
+                self.gen_stmt(else_node, fn)
+            # Continuation (L3)
             fn.body.append(Instr("label", end_b, None, None))
         elif kind == "While":
             start = self.new_label()
             end = self.new_label()
             fn.body.append(Instr("label", start, None, None))
-            cond, ct = self.gen_expr(node[1], fn)
-            fn.body.append(Instr("ifFalse", cond, end, None))
+            cond_node = node[1]
+            self._gen_cond_jump(cond_node, end, fn)
             self.gen_stmt(node[2], fn)
             fn.body.append(Instr("goto", start, None, None))
             fn.body.append(Instr("label", end, None, None))
         elif kind == "For":
             if node[1] is not None:
-                self.gen_stmt(node[1], fn) if node[1][0] != "VarDecl" else self.gen_stmt(("VarDecl",) + node[1][1:], fn) if False else self._gen_for_init(node[1], fn)
+                self._gen_for_init(node[1], fn)
             start = self.new_label()
             end = self.new_label()
-            cont = self.new_label()
+            body = self.new_label()
             fn.body.append(Instr("label", start, None, None))
             if node[2] is not None:
-                cond, ct = self.gen_expr(node[2], fn)
-                fn.body.append(Instr("ifFalse", cond, end, None))
-            if node[3] is not None:
-                pass
+                cond_node = node[2]
+                # For loops: jump to body when condition is TRUE, else fall through to end
+                self._gen_cond_jump(cond_node, body, fn)
+                # If condition is false, jump to end
+                fn.body.append(Instr("goto", end, None, None))
+                fn.body.append(Instr("label", body, None, None))
+            else:
+                # Infinite loop: just label the body
+                body = self.new_label()
+                fn.body.append(Instr("label", body, None, None))
             self.gen_stmt(node[4], fn)
             # step
             if node[3] is not None:
-                if isinstance(node[3], tuple) and node[3][0] == "IncDec":
-                    self.gen_stmt(("ExprStmt", node[3]), fn)
-                elif isinstance(node[3], tuple) and node[3][0] == "Assign":
-                    self.gen_stmt(("ExprStmt", node[3]), fn)
+                step_node = node[3]
+                if isinstance(step_node, tuple):
+                    step_node = _skip_loc(step_node)
+                    if step_node[0] == "IncDec":
+                        self.gen_stmt(("ExprStmt", step_node), fn)
+                    elif step_node[0] == "Assign":
+                        self.gen_stmt(("ExprStmt", step_node), fn)
             fn.body.append(Instr("goto", start, None, None))
             fn.body.append(Instr("label", end, None, None))
         elif kind == "Block":
@@ -198,59 +269,43 @@ class CGenerator:
                 fn.body.append(Instr("return", None, None, None))
         elif kind == "Printf":
             fmt = node[1]
-            if isinstance(fmt, str) and len(fmt) >= 2 and fmt[0] == '"' and fmt[-1] == '"' :
+            if isinstance(fmt, str) and len(fmt) >= 2 and fmt[0] == '"' and fmt[-1] == '"':
                 fmt = fmt[1:-1]
             args = node[2]
-            # walk format string for % specifiers
-            ai = 0
-            i = 0
-            # emit literal text segments and out_val for each specifier
-            buf = ""
-            while i < len(fmt):
-                if fmt[i] == "%" and i+1 < len(fmt):
-                    # flush buf
-                    if buf:
-                        fn.body.append(Instr("out_str", buf, None, None))
-                        buf = ""
-                    spec_char = fmt[i+1]
-                    # determine full spec (width/flags)
-                    # simple: handle %d, %u, %c, %x, %ld etc
-                    spec = spec_char
-                    if spec_char in "duxXc":
-                        if ai < len(args):
-                            addr, t = self.gen_expr(args[ai], fn)
-                            fn.body.append(Instr("out_val", addr, spec, None, ty="i32"))
-                            ai += 1
-                        i += 2
-                        continue
-                    else:
-                        buf += fmt[i]
-                        i += 1
-                        continue
-                else:
-                    buf += fmt[i]
-                    i += 1
-            if buf:
-                fn.body.append(Instr("out_str", buf, None, None))
+            # First, generate all argument expressions (may create temporaries)
+            arg_addrs = []
+            for arg in args:
+                addr, t = self.gen_expr(arg, fn)
+                arg_addrs.append((addr, t))
+            # Emit param for format string
+            fn.body.append(Instr("param", fmt, None, None, ty="str"))
+            # Emit param for each argument
+            for addr, t in arg_addrs:
+                fn.body.append(Instr("param", addr, None, None, ty=t))
+            # Emit call to printf
+            tmp = self.new_temp()
+            fn.var_types[tmp] = "i32"
+            fn.body.append(Instr("call", "printf", len(args) + 1, tmp, ty="i32"))
         elif kind == "Putchar":
             addr, t = self.gen_expr(node[1], fn)
             fn.body.append(Instr("out_val", addr, "c", None, ty="i32"))
         elif kind == "Empty":
             pass
         else:
-            # try expression
             try:
                 addr, t = self.gen_expr(node, fn)
             except Exception:
                 pass
 
     def _gen_for_init(self, node, fn):
+        node = _skip_loc(node)
         if node[0] == "VarDecl":
-            self.gen_stmt(node, fn) if False else self.gen_stmt(("VarDecl",) + node[1:], fn)
+            self.gen_stmt(node, fn)
         else:
             self.gen_stmt(("ExprStmt", node), fn)
 
     def gen_expr(self, node, fn):
+        node = _skip_loc(node)
         kind = node[0]
         if kind == "IntLit":
             return node[1], node[2]
@@ -277,7 +332,6 @@ class CGenerator:
             ra, rt = self.gen_expr(node[3], fn)
             # cast to common type
             from frontend.c_types import common_type, CType
-            # parse types
             def to_ct(ty):
                 if isinstance(ty, CType): return ty
                 if isinstance(ty, str):
@@ -324,10 +378,14 @@ class CGenerator:
             arg_ops = []
             for a in node[2]:
                 ao, at = self.gen_expr(a, fn)
-                arg_ops.append(ao)
+                arg_ops.append((ao, at))
+            # emit param instructions
+            for ao, at in arg_ops:
+                fn.body.append(Instr("param", ao, None, None, ty=at))
+            # emit call
             tmp = self.new_temp()
             fn.var_types[tmp] = "i32"
-            fn.body.append(Instr("call", node[1], None, tmp, ty="i32", args=tuple(arg_ops)))
+            fn.body.append(Instr("call", node[1], len(arg_ops), tmp, ty="i32"))
             return tmp, "i32"
         if kind == "IncDec":
             # as expression (prefix): return new value
@@ -349,6 +407,7 @@ class CGenerator:
                 fn.body.append(Instr("copy", tmp, None, name, ty=vtag))
                 return old, vtag
         raise ValueError("unknown expr %s" % kind)
+
 
 def generate_c(tu):
     g = CGenerator()

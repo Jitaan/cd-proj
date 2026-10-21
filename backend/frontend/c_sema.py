@@ -13,6 +13,15 @@ class UnsupportedFeatureError(Exception):
         self.feature = feature; self.line = line; self.col = col
         super().__init__("%d:%d: unsupported: %s" % (line, col, feature))
 
+def _get_loc(node):
+    """Extract (line, col) from AST node. Returns (0, 0) if not found."""
+    if isinstance(node, tuple) and len(node) > 0:
+        # Check last element if it's a location tuple
+        last = node[-1]
+        if isinstance(last, tuple) and len(last) == 2 and all(isinstance(x, int) for x in last):
+            return last
+    return (0, 0)
+
 class Sema:
     def __init__(self):
         self.scopes = [{}]  # list of dict name->unique
@@ -55,23 +64,20 @@ class Sema:
 
     def annotate_expr(self, node):
         kind = node[0]
+        loc = _get_loc(node)
         if kind == "IntLit":
             ty = _tag_to_ctype(node[2])
             return node, ty
         if kind == "CharLit":
             return node, CType(32, True)
         if kind == "Ident":
-            uniq, ty = self.lookup(node[1], 0, 0)
+            uniq, ty = self.lookup(node[1], loc[0], loc[1])
             # rewrite node to unique
             new = ("Ident", uniq)
-            new = (new[0], uniq)
-            # store type by returning
             return new, ty
         if kind == "StringLit":
             return node, None
         if kind == "Cast":
-            ty = parse_type_specifiers([s for s in node[1][1] if s != "const"]) if isinstance(node[1], tuple) else None
-            # node[1] is ("Type", specs)
             specs = node[1][1]
             ty = parse_type_specifiers(specs)
             e, et = self.annotate_expr(node[2])
@@ -120,10 +126,11 @@ class Sema:
         return node, CType(32, True)
 
     def analyze_decl(self, node, is_global=False):
+        loc = _get_loc(node)
         ty_specs = node[1][1] if isinstance(node[1], tuple) else node[1]
         ty = parse_type_specifiers(ty_specs)
         name = node[2]
-        uniq = self.declare(name, ty, 0, 0, is_global=is_global)
+        uniq = self.declare(name, ty, loc[0], loc[1], is_global=is_global)
         init = node[3]
         if init is not None:
             ie, it = self.annotate_expr(init)
@@ -134,6 +141,7 @@ class Sema:
 
     def analyze_stmt(self, node):
         kind = node[0]
+        loc = _get_loc(node)
         if kind == "VarDecl":
             return self.analyze_decl(node)
         if kind == "Block":
@@ -145,19 +153,19 @@ class Sema:
             c, ct = self.annotate_expr(node[1])
             t = self.analyze_stmt(node[2])
             e = self.analyze_stmt(node[3]) if node[3] else None
-            return ("If", c, t, e)
+            return ("If", c, t, e, loc)
         if kind == "While":
             self.loop_depth += 1
             c, ct = self.annotate_expr(node[1])
             b = self.analyze_stmt(node[2])
             self.loop_depth -= 1
-            return ("While", c, b)
+            return ("While", c, b, loc)
         if kind == "DoWhile":
             self.loop_depth += 1
             b = self.analyze_stmt(node[1])
             c, ct = self.annotate_expr(node[2])
             self.loop_depth -= 1
-            return ("DoWhile", b, c)
+            return ("DoWhile", b, c, loc)
         if kind == "For":
             self.enter_scope()
             init = None
@@ -175,22 +183,22 @@ class Sema:
             body = self.analyze_stmt(node[4])
             self.loop_depth -= 1
             self.exit_scope()
-            return ("For", init, cond, step, body)
+            return ("For", init, cond, step, body, loc)
         if kind == "Return":
             e = None
             if node[1] is not None:
                 e, _ = self.annotate_expr(node[1])
-            return ("Return", e)
+            return ("Return", e, loc)
         if kind == "ExprStmt":
             e, _ = self.annotate_expr(node[1])
-            return ("ExprStmt", e)
+            return ("ExprStmt", e, loc)
         if kind == "Break":
             if self.loop_depth == 0:
-                raise SemanticError(0, 0, "break outside loop")
+                raise SemanticError(loc[0], loc[1], "break outside loop")
             return node
         if kind == "Continue":
             if self.loop_depth == 0:
-                raise SemanticError(0, 0, "continue outside loop")
+                raise SemanticError(loc[0], loc[1], "continue outside loop")
             return node
         if kind in ("Empty",):
             return node
@@ -199,20 +207,21 @@ class Sema:
             for a in node[2]:
                 ae, _ = self.annotate_expr(a)
                 args.append(ae)
-            return ("Printf", node[1], args)
+            return ("Printf", node[1], args, loc)
         if kind == "Scanf":
             return node
         if kind == "Putchar":
             e, _ = self.annotate_expr(node[1])
-            return ("Putchar", e)
+            return ("Putchar", e, loc)
         return node
 
     def analyze_func(self, node):
         ty = node[1]
         ret_ty = parse_type_specifiers(ty[1])
         name = node[2]
+        loc = _get_loc(node)
         if name in self.functions:
-            raise SemanticError(0, 0, "redefinition of %s" % name)
+            raise SemanticError(loc[0], loc[1], "redefinition of %s" % name)
         self.functions[name] = (ret_ty, node[3])
         # params
         self.current_func_ret = ret_ty
@@ -220,13 +229,13 @@ class Sema:
         params = []
         for p in node[3]:
             pty = parse_type_specifiers(p[0][1])
-            uniq = self.declare(p[1], pty, 0, 0)
+            uniq = self.declare(p[1], pty, p[2][0], p[2][1])
             params.append((uniq, pty))
         self.functions[name] = (ret_ty, params)
         body = self.analyze_stmt(node[4])
         self.exit_scope()
         self.current_func_ret = None
-        return ("FuncDef", ret_ty, name, params, body)
+        return ("FuncDef", ret_ty, name, params, body, loc)
 
     def analyze_tu(self, node):
         new_decls = []
@@ -236,13 +245,14 @@ class Sema:
             elif d[0] == "GlobalVar":
                 ty = parse_type_specifiers(d[1][1])
                 name = d[2]
-                uniq = self.declare(name, ty, 0, 0, is_global=True)
+                loc = _get_loc(d)
+                uniq = self.declare(name, ty, loc[0], loc[1], is_global=True)
                 init = d[3]
                 if init is not None:
                     ie, _ = self.annotate_expr(init)
-                    new_decls.append(("GlobalVar", ty, uniq, ie))
+                    new_decls.append(("GlobalVar", ty, uniq, ie, loc))
                 else:
-                    new_decls.append(("GlobalVar", ty, uniq, None))
+                    new_decls.append(("GlobalVar", ty, uniq, None, loc))
             else:
                 new_decls.append(d)
         # require main

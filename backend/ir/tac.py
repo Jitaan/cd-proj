@@ -6,7 +6,7 @@ from collections import namedtuple
 import re
 
 # Instr with ty and args (C1+C2)
-class Instr(namedtuple("Instr", "op arg1 arg2 result ty args", defaults=(None, None, None, "i32", ()))):
+class Instr(namedtuple("Instr", "op arg1 arg2 result ty args op_relop", defaults=(None, None, None, "i32", (), None))):
     @property
     def a(self): return self.arg1
     @property

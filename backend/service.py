@@ -72,7 +72,7 @@ def _run_one(source, mode, passes_list=None):
     # size guard
     if len(source) > 20000 or source.count("\n") > 300:
         result["ok"] = False
-        result["error"] = {"stage": "lex", "line": None,
+        result["error"] = {"stage": "lex", "line": None, "col": None,
                            "msg": "source too large (max 300 lines / 20000 chars)"}
         return result
     # lex
@@ -80,17 +80,17 @@ def _run_one(source, mode, passes_list=None):
         toks = tokenize(source)
     except LexError as e:
         result["ok"] = False
-        result["error"] = {"stage": "lex", "line": getattr(e, "line", None), "msg": str(e)}
+        result["error"] = {"stage": "lex", "line": getattr(e, "line", None), "col": getattr(e, "col", None), "msg": str(e)}
         return result
-    result["tokens"] = toks
+    result["tokens"] = [(t[0], t[1], t[2]) for t in toks]
     # parse
     try:
         from parser import parse
         ast = parse(source)
     except Exception as e:
         result["ok"] = False
-        result["error"] = {"stage": "parse", "line": getattr(e, "line", None), "msg": str(e)}
-        result["tokens"] = toks
+        result["error"] = {"stage": "parse", "line": getattr(e, "line", None), "col": getattr(e, "col", None), "msg": str(e)}
+        result["tokens"] = [(t[0], t[1], t[2]) for t in toks]
         return result
     result["ast"] = str(ast)
     result["typed_ast"] = str(ast)  # no separate typed AST in this project
@@ -99,7 +99,7 @@ def _run_one(source, mode, passes_list=None):
         tac_before = generate(ast)
     except Exception as e:
         result["ok"] = False
-        result["error"] = {"stage": "sema", "line": getattr(e, "line", None), "msg": str(e)}
+        result["error"] = {"stage": "sema", "line": getattr(e, "line", None), "col": getattr(e, "col", None), "msg": str(e)}
         return result
     result["tac_before"] = [str(i) for i in tac_before]
     # run original
@@ -107,7 +107,7 @@ def _run_one(source, mode, passes_list=None):
         out_before, dyn_before = run_tac(tac_before)
     except Exception as e:
         result["ok"] = False
-        result["error"] = {"stage": "runtime", "line": None, "msg": str(e)}
+        result["error"] = {"stage": "runtime", "line": None, "col": None, "msg": str(e)}
         result["tac_before"] = [str(i) for i in tac_before]
         return result
     result["output_before"] = [str(x) for x in out_before]
@@ -122,7 +122,7 @@ def _run_one(source, mode, passes_list=None):
         # model missing -> error in ai mode handled below; still continue
         if mode == "ai":
             result["ok"] = False
-            result["error"] = {"stage": "advisor", "line": None, "msg": str(e)}
+            result["error"] = {"stage": "advisor", "line": None, "col": None, "msg": str(e)}
             return result
     result["recommended"] = sorted(recommended)
     # decide passes to run
@@ -143,7 +143,7 @@ def _run_one(source, mode, passes_list=None):
         tac_after = passes.optimise(tac_before, enabled, log=log)
     except Exception as e:
         result["ok"] = False
-        result["error"] = {"stage": "runtime", "line": None, "msg": str(e)}
+        result["error"] = {"stage": "optimize", "line": None, "col": None, "msg": str(e)}
         return result
     result["tac_after"] = [str(i) for i in tac_after]
     result["trace"] = list(log)
@@ -152,7 +152,7 @@ def _run_one(source, mode, passes_list=None):
         out_after, dyn_after = run_tac(tac_after)
     except Exception as e:
         result["ok"] = False
-        result["error"] = {"stage": "runtime", "line": None, "msg": str(e)}
+        result["error"] = {"stage": "runtime", "line": None, "col": None, "msg": str(e)}
         result["output_after"] = []
         result["match"] = False
         return result
@@ -166,7 +166,7 @@ def _run_one(source, mode, passes_list=None):
     }
     if not result["match"]:
         result["ok"] = False
-        result["error"] = {"stage": "verify", "line": None,
+        result["error"] = {"stage": "verify", "line": None, "col": None,
                            "msg": "outputs differ"}
     return result
 
@@ -178,25 +178,79 @@ def _run_c(source, mode, passes_list):
               "metrics": {"static_before": 0, "static_after": 0,
                           "dynamic_before": 0, "dynamic_after": 0},
               "output_before": [], "output_after": [], "match": False}
+    # size guard
+    if len(source) > 20000 or source.count("\n") > 300:
+        result["ok"] = False
+        result["error"] = {"stage": "lex", "line": None,
+                           "msg": "source too large (max 300 lines / 20000 chars)"}
+        return result
     try:
         import sys, os
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "frontend"))
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "ir"))
-        from preprocess import preprocess
-        from c_lexer import lex_c
-        from c_parser import Parser
-        from c_sema import analyze
+        from preprocess import preprocess, PreprocessError
+        from c_lexer import lex_c, CLexError
+        from c_parser import Parser, CParseError
+        from c_sema import analyze, SemanticError
         from ir.c_gen import generate_c
         from ir.interpreter import run_program
         from ir.program import Program
-        toks = lex_c(preprocess(source))
-        result["tokens"] = [(t.kind, t.value, t.line) for t in toks]
-        ast, sema = analyze(Parser(toks).parse_translation_unit())
+        
+        # preprocess
+        try:
+            processed = preprocess(source)
+        except PreprocessError as e:
+            result["ok"] = False
+            result["error"] = {"stage": "preprocess", "line": e.line, "col": 1, "msg": e.msg}
+            return result
+        
+        # lex
+        try:
+            toks = lex_c(processed)
+        except CLexError as e:
+            result["ok"] = False
+            result["error"] = {"stage": "lex", "line": e.line, "col": e.col, "msg": e.msg}
+            return result
+        result["tokens"] = [(t.kind, t.value, t.line, t.col) for t in toks]
+        
+        # parse
+        try:
+            p = Parser(toks)
+            ast = p.parse_translation_unit()
+        except CParseError as e:
+            result["ok"] = False
+            result["error"] = {"stage": "parse", "line": e.line, "col": e.col, "msg": e.msg}
+            return result
         result["ast"] = str(ast)
-        prog = generate_c(ast)
-        r1 = run_program(prog)
+        
+        # semantic analysis
+        try:
+            typed_ast, sema = analyze(ast)
+        except SemanticError as e:
+            result["ok"] = False
+            result["error"] = {"stage": "sema", "line": e.line, "col": e.col, "msg": e.msg}
+            return result
+        result["typed_ast"] = str(typed_ast)
+        
+        # code generation
+        try:
+            prog = generate_c(typed_ast)
+        except Exception as e:
+            result["ok"] = False
+            result["error"] = {"stage": "codegen", "line": None, "col": None, "msg": str(e)}
+            return result
+        
+        # run original
+        try:
+            r1 = run_program(prog)
+        except Exception as e:
+            result["ok"] = False
+            result["error"] = {"stage": "runtime", "line": None, "col": None, "msg": str(e)}
+            result["tac_before"] = [str(i) for i in prog.all_instrs()]
+            return result
         result["output_before"] = [str(x) for x in r1.output] + ([r1.stdout] if r1.stdout else [])
         result["tac_before"] = [str(i) for i in prog.all_instrs()]
+        
         # optimize main function body
         from passes import optimise, PassContext
         fn = prog.main()
@@ -214,13 +268,27 @@ def _run_c(source, mode, passes_list):
             except Exception:
                 enabled = set(["fold", "dce"])
         if mode == "all":
-            enabled = set(["fold", "dce"])
+            enabled = set(passes.ADVISED)
         result["passes_run"] = sorted(enabled)
         log = []
-        new_body = optimise(list(fn.body), enabled, ctx=ctx, log=log)
+        try:
+            new_body = optimise(list(fn.body), enabled, ctx=ctx, log=log)
+        except Exception as e:
+            result["ok"] = False
+            result["error"] = {"stage": "optimize", "line": None, "col": None, "msg": str(e)}
+            return result
         fn.body = new_body
         result["trace"] = list(log)
-        r2 = run_program(prog)
+        
+        # run optimized
+        try:
+            r2 = run_program(prog)
+        except Exception as e:
+            result["ok"] = False
+            result["error"] = {"stage": "runtime", "line": None, "col": None, "msg": str(e)}
+            result["output_after"] = []
+            result["match"] = False
+            return result
         result["output_after"] = [str(x) for x in r2.output] + ([r2.stdout] if r2.stdout else [])
         result["tac_after"] = [str(i) for i in prog.all_instrs()]
         result["match"] = (r1.stdout == r2.stdout and r1.exit_code == r2.exit_code and r1.error == r2.error)
@@ -233,19 +301,31 @@ def _run_c(source, mode, passes_list):
         }
         if not result["match"]:
             result["ok"] = False
-            result["error"] = {"stage": "verify", "line": None, "msg": "outputs differ"}
+            result["error"] = {"stage": "verify", "line": None, "col": None, "msg": "outputs differ"}
         if r1.error or r2.error:
             result["ok"] = False
-            result["error"] = {"stage": "runtime", "line": None, "msg": r1.error or r2.error}
+            result["error"] = {"stage": "runtime", "line": None, "col": None, "msg": r1.error or r2.error}
     except Exception as e:
         result["ok"] = False
-        result["error"] = {"stage": "parse", "line": None, "msg": str(e)}
+        result["error"] = {"stage": "unknown", "line": None, "col": None, "msg": str(e)}
     return result
 
-def run_pipeline(source, mode="ai", passes=None, lang="mini"):
+def run_pipeline(source, mode="ai", passes=None, lang="c"):
     if lang == "c":
         return _run_c(source, mode, passes)
-    return _run_one(source, mode, passes)
+    elif lang == "mini":
+        return _run_one(source, mode, passes)
+    else:
+        return {
+            "ok": False,
+            "error": {"stage": "config", "line": None, "msg": "unknown language '%s' (use 'c' or 'mini')" % lang},
+            "tokens": [], "ast": "", "typed_ast": "",
+            "tac_before": [], "tac_after": [], "features": {},
+            "recommended": [], "predictions": {}, "passes_run": [],
+            "trace": [], "metrics": {"static_before": 0, "static_after": 0,
+                                    "dynamic_before": 0, "dynamic_after": 0},
+            "output_before": [], "output_after": [], "match": False
+        }
 
 
 def compare_modes(source):

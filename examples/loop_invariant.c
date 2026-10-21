@@ -5,5 +5,5 @@ int main() {
     int t = 2*3+1;
     s += t;
   }
-  print(s);
+  printf("%d\n", s);
 }

@@ -4,5 +4,5 @@ int main() {
   int x = a*b + 1;
   a = 5;
   int y = a*b + 1;
-  print(x + y);
+  printf("%d\n", x + y);
 }

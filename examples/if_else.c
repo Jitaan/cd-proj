@@ -2,9 +2,9 @@ int main() {
   int x = 5;
   int y = 3;
   if (x > y) {
-    print(x + y);
+    printf("%d\n", x + y);
   } else {
-    print(x - y);
+    printf("%d\n", x - y);
   }
-  print(x);
+  printf("%d\n", x);
 }

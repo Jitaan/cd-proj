@@ -56,6 +56,12 @@ def run_program(prog, inputs=None, max_steps=1_000_000, max_depth=1000):
         if isinstance(operand, int):
             return operand
         if isinstance(operand, str):
+            # Check if it's a string literal (contains chars not valid in C identifiers)
+            # C identifiers: start with letter/underscore, then letters/digits/underscores
+            import re
+            if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', operand):
+                # It's a literal (format string, etc.)
+                return operand
             # check locals
             if operand in frame["locals"]:
                 ty, val = frame["locals"][operand]
@@ -146,6 +152,38 @@ def run_program(prog, inputs=None, max_steps=1_000_000, max_depth=1000):
                         target = idx
                         break
                 frame["pc"] = target
+            elif ins.op == "if":
+                # if x relop y goto L
+                a = get_val(frame, ins.arg1)
+                b = get_val(frame, ins.arg2)
+                target_label = ins.result
+                relop = ins.op_relop
+                
+                # Evaluate the condition
+                if relop == "<":
+                    cond = a < b
+                elif relop == ">":
+                    cond = a > b
+                elif relop == "<=":
+                    cond = a <= b
+                elif relop == ">=":
+                    cond = a >= b
+                elif relop == "==":
+                    cond = a == b
+                elif relop == "!=":
+                    cond = a != b
+                else:
+                    raise ValueError("unknown relop %s" % relop)
+                
+                if cond:
+                    target = None
+                    for idx, x in enumerate(body):
+                        if x.op == "label" and x.arg1 == target_label:
+                            target = idx
+                            break
+                    frame["pc"] = target
+                else:
+                    frame["pc"] += 1
             elif ins.op == "ifFalse":
                 c = get_val(frame, ins.arg1)
                 if c == 0:
@@ -182,24 +220,42 @@ def run_program(prog, inputs=None, max_steps=1_000_000, max_depth=1000):
                 from ir.tac import wrap
                 set_val(frame, ins.result, wrap(val, ty))
                 frame["pc"] += 1
+            elif ins.op == "param":
+                # Store param value in frame for later use by call
+                if "_params" not in frame:
+                    frame["_params"] = []
+                frame["_params"].append(get_val(frame, ins.arg1))
+                frame["pc"] += 1
             elif ins.op == "call":
-                # evaluate args
-                args = []
-                for a in (ins.args or ()):
-                    args.append(get_val(frame, a))
+                # Use params stored by param instructions
+                args = frame.get("_params", [])
+                frame["_params"] = []  # Reset for next call
                 # find function
                 callee = prog.functions.get(ins.arg1)
                 if callee is None:
+                    # Handle built-in functions like printf
+                    if ins.arg1 == "printf":
+                        # Handle printf: first arg is format string, rest are args
+                        fmt = args[0] if args else ""
+                        vals = args[1:] if len(args) > 1 else []
+                        # Simple printf handling
+                        result.stdout += fmt % tuple(vals) if vals else fmt
+                        frame["pc"] += 1
+                        continue
+                    else:
+                        result.error = "undefined function"
+                        break
+                # push frame for user functions
+                callee = prog.functions.get(ins.arg1)
+                if callee is not None:
+                    new_frame = make_frame(callee, args)
+                    call_stack.append(new_frame)
+                    frame["_pending_result"] = ins.result
+                    frame["_pending_ty"] = ins.ty or (callee.ret_ty or "i32")
+                    frame["pc"] += 1
+                else:
                     result.error = "undefined function"
                     break
-                # push frame
-                new_frame = make_frame(callee, args)
-                # bind return? we'll handle on return
-                call_stack.append(new_frame)
-                # if result var, we'll set when callee returns; store pending
-                frame["_pending_result"] = ins.result
-                frame["_pending_ty"] = ins.ty or (callee.ret_ty or "i32")
-                frame["pc"] += 1
             elif ins.op == "return":
                 retval = None
                 if ins.arg1 is not None:

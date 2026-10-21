@@ -9,7 +9,7 @@ def main():
     ap.add_argument("file", nargs="?")
     ap.add_argument("--passes", choices=["none", "all", "ai", "custom"], default="ai")
     ap.add_argument("--pass-list", default="")
-    ap.add_argument("--lang", choices=["mini","c"], default="mini")
+    ap.add_argument("--lang", choices=["c", "mini"], default="c")
     ap.add_argument("--benchmark", metavar="DIR")
     args = ap.parse_args()
 

@@ -404,9 +404,16 @@ class CGenerator:
             elif op == "~":
                 fn.body.append(Instr("bnot", addr, None, tmp, ty=t))
             elif op == "*":
-                fn.body.append(Instr("load", addr, None, tmp, ty=t))
+                pt = t
+                elem_ty = getattr(pt, "pointee", None)
+                if elem_ty is None:
+                    elem_ty = t
+                fn.var_types[tmp] = elem_ty
+                fn.body.append(Instr("load", addr, 0, tmp, ty=elem_ty))
             elif op == "&":
-                fn.body.append(Instr("addr", addr, None, tmp, ty=t))
+                pt = Type.pointer(t) if not (isinstance(t, Type) and t.kind == "pointer") else t
+                fn.var_types[tmp] = pt
+                fn.body.append(Instr("addr", addr, None, tmp, ty=pt))
             return tmp, t
         if kind == "BinOp":
             op = node[1]

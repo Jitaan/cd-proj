@@ -1,12 +1,17 @@
 import React, { useState, useEffect } from "react";
 import ReactDOM from "react-dom/client";
+import "./index.css";
 
 const API = "http://127.0.0.1:8000";
 
-function Card({ title, children }) {
+function Card({ title, children, className = "" }) {
   return (
-    <div className="rounded-2xl border border-slate-800 bg-slate-900/80 p-5 shadow-xl shadow-black/20">
-      <h3 className="mb-3 text-xs font-bold uppercase tracking-[0.16em] text-indigo-400">{title}</h3>
+    <div className={`rounded-md border border-border bg-card p-4 ${className}`}>
+      {title && (
+        <h3 className="mb-3 text-xs font-semibold uppercase tracking-[0.16em] text-muted-foreground">
+          {title}
+        </h3>
+      )}
       {children}
     </div>
   );
@@ -26,89 +31,163 @@ function App() {
 
   const run = async (m = mode) => {
     setLoading(true);
-    const res = await fetch(API + "/api/run", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ source, mode: m, passes: null }),
-    });
-    setResult(await res.json());
-    setLoading(false);
+    try {
+      const res = await fetch(API + "/api/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source, mode: m, passes: null }),
+      });
+      setResult(await res.json());
+    } catch (e) {
+      setResult({ ok: false, error: { line: 0, msg: String(e) } });
+    } finally {
+      setLoading(false);
+    }
   };
 
-  return (
-    <div className="min-h-screen bg-slate-950 text-slate-100">
-      <main className="mx-auto max-w-4xl px-4 py-10 sm:px-6 sm:py-16">
-        <header className="mb-10 text-center">
-          
-          <h1 className="bg-gradient-to-r from-indigo-300 via-violet-300 to-fuchsia-300 bg-clip-text text-4xl font-extrabold text-transparent sm:text-5xl">
-            AI-Assisted Intermediate Code Optimization
-          </h1>
-          <p className="mt-3 text-slate-400">AI-assisted three-address code optimization</p>
-        </header>
+  const inputClass =
+    "w-full rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground outline-none transition focus:border-ring focus:ring-2 focus:ring-ring/40";
+  const selectClass =
+    "w-full rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground outline-none transition focus:border-ring focus:ring-2 focus:ring-ring/40";
 
-        <section className="space-y-6">
-          <Card title="Source code">
-              <div className="mb-4 flex flex-col gap-3 sm:flex-row">
-                <select aria-label="Choose an example" className="flex-1 rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm text-slate-200 outline-none transition focus:border-indigo-400 focus:ring-4 focus:ring-indigo-950"
-                  onChange={(e) => { if (examples[e.target.value]) setSource(examples[e.target.value]); }}>
+  const outputs = result
+    ? [
+        ["Output before", (result.output_before || []).join("\n")],
+        ["Output after", (result.output_after || []).join("\n")],
+        ["TAC before", (result.tac_before || []).join("\n")],
+        ["TAC after", (result.tac_after || []).join("\n")],
+        ["Features", JSON.stringify(result.features, null, 2)],
+        ["Passes run", (result.passes_run || []).join(", ")],
+        ["Trace", JSON.stringify(result.trace)],
+      ]
+    : [];
+
+  return (
+    <div className="flex min-h-screen flex-col bg-background text-foreground">
+      <header className="border-b border-border">
+        <div className="mx-auto flex max-w-7xl items-center justify-between px-4 py-4 sm:px-6">
+          <div>
+            <h1 className="text-lg font-bold tracking-tight sm:text-xl">
+              AI-Assisted Intermediate Code Optimization
+            </h1>
+            <p className="text-xs text-muted-foreground">
+              three-address code optimization dashboard
+            </p>
+          </div>
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <span className="inline-block h-2 w-2 rounded-full bg-foreground" />
+            ready
+          </div>
+        </div>
+      </header>
+
+      <main className="mx-auto w-full max-w-7xl flex-1 px-4 py-6 sm:px-6">
+        <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+          <section className="flex flex-col gap-4">
+            <Card title="Source code">
+              <div className="mb-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <select
+                  aria-label="Choose an example"
+                  className={selectClass}
+                  onChange={(e) => {
+                    if (examples[e.target.value]) setSource(examples[e.target.value]);
+                  }}
+                >
                   <option value="">-- select example --</option>
-                  {Object.keys(examples).map(k => <option key={k} value={k}>{k}</option>)}
+                  {Object.keys(examples).map((k) => (
+                    <option key={k} value={k}>
+                      {k}
+                    </option>
+                  ))}
                 </select>
-                <select aria-label="Language" className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm text-slate-200 outline-none transition focus:border-indigo-400 focus:ring-4 focus:ring-indigo-950" value={lang} onChange={(e) => setLang(e.target.value)}>
-                <option value="c">C</option>
-                <option value="mini">MiniC</option>
-              </select>
+                <select
+                  aria-label="Language"
+                  className={selectClass}
+                  value={lang}
+                  onChange={(e) => setLang(e.target.value)}
+                >
+                  <option value="c">C</option>
+                  <option value="mini">MiniC</option>
+                </select>
               </div>
-              <textarea aria-label="MiniC source code" value={source} onChange={(e) => setSource(e.target.value)} rows={16} placeholder="Write or select a MiniC program to optimize..."
-                className="w-full resize-y rounded-xl border border-slate-700 bg-black p-4 font-mono text-sm leading-6 text-slate-100 outline-none placeholder:text-slate-600 transition focus:border-indigo-400 focus:ring-4 focus:ring-indigo-950" />
-              <div className="mt-4 flex flex-col gap-3 sm:flex-row">
-                <button onClick={() => run(mode)} disabled={loading}
-                  className="flex-1 rounded-xl bg-indigo-500 py-3 font-semibold text-white shadow-lg shadow-indigo-950/50 transition hover:bg-indigo-400 focus:outline-none focus:ring-4 focus:ring-indigo-950 disabled:cursor-not-allowed disabled:opacity-50">
+              <textarea
+                aria-label="MiniC source code"
+                value={source}
+                onChange={(e) => setSource(e.target.value)}
+                rows={18}
+                placeholder="Write or select a MiniC program to optimize..."
+                className="w-full resize-y rounded-md border border-input bg-background p-3 font-mono text-sm leading-6 text-foreground outline-none placeholder:text-muted-foreground transition focus:border-ring focus:ring-2 focus:ring-ring/40"
+              />
+              <div className="mt-3 flex flex-col gap-3 sm:flex-row">
+                <button
+                  onClick={() => run(mode)}
+                  disabled={loading}
+                  className="flex-1 rounded-md bg-primary py-2.5 text-sm font-semibold text-primary-foreground transition hover:opacity-90 focus:outline-none focus:ring-2 focus:ring-ring/40 disabled:cursor-not-allowed disabled:opacity-50"
+                >
                   {loading ? "Running..." : "Run Optimizer"}
                 </button>
-                <button onClick={() => run("tac")} disabled={loading}
-                  className="rounded-xl border border-slate-700 bg-slate-800 px-5 py-3 font-semibold text-slate-200 transition hover:bg-slate-700 focus:outline-none focus:ring-4 focus:ring-slate-800 disabled:cursor-not-allowed disabled:opacity-50">
+                <button
+                  onClick={() => run("tac")}
+                  disabled={loading}
+                  className="rounded-md border border-border bg-secondary px-5 py-2.5 text-sm font-semibold text-secondary-foreground transition hover:bg-muted focus:outline-none focus:ring-2 focus:ring-ring/40 disabled:cursor-not-allowed disabled:opacity-50"
+                >
                   Generate TAC only
                 </button>
               </div>
-          </Card>
+            </Card>
+          </section>
 
-          <section aria-live="polite" className="space-y-4">
+          <section className="flex flex-col gap-4">
             {!result && (
               <Card title="Result">
-                <p className="text-slate-400">Your compiled program and optimization details will appear here.</p>
+                <p className="text-sm text-muted-foreground">
+                  Run the optimizer to see metrics and transformed code here.
+                </p>
               </Card>
             )}
             {result && (
               <>
-                <div className={`rounded-xl border p-4 font-semibold ${result.ok ? "border-emerald-900 bg-emerald-950/60 text-emerald-300" : "border-red-900 bg-red-950/60 text-red-300"}`}>
-                  {result.ok ? "Output match: YES" : ("ERROR: " + (result.error && (result.error.line + ": " + result.error.msg)))}
+                <div
+                  className={`rounded-md border p-3 text-sm font-semibold ${
+                    result.ok
+                      ? "border-foreground text-foreground"
+                      : "border-destructive text-destructive"
+                  }`}
+                >
+                  {result.ok
+                    ? "Output match: YES"
+                    : "ERROR: " +
+                      (result.error && (result.error.line + ": " + result.error.msg))}
                 </div>
-                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <div className="grid grid-cols-2 gap-3">
                   <Card title="Static instructions">
-                    <div className="text-3xl font-bold text-indigo-600">{result.metrics.static_before} <span className="text-slate-300">→</span> {result.metrics.static_after}</div>
+                    <div className="text-2xl font-bold">
+                      {result.metrics.static_before}{" "}
+                      <span className="text-muted-foreground">→</span>{" "}
+                      {result.metrics.static_after}
+                    </div>
                   </Card>
                   <Card title="Dynamic instructions">
-                    <div className="text-3xl font-bold text-violet-600">{result.metrics.dynamic_before} <span className="text-slate-300">→</span> {result.metrics.dynamic_after}</div>
+                    <div className="text-2xl font-bold">
+                      {result.metrics.dynamic_before}{" "}
+                      <span className="text-muted-foreground">→</span>{" "}
+                      {result.metrics.dynamic_after}
+                    </div>
                   </Card>
                 </div>
-                {[
-                  ["Output before", (result.output_before || []).join("\n")],
-                  ["Output after", (result.output_after || []).join("\n")],
-                  ["TAC before", (result.tac_before || []).join("\n")],
-                  ["TAC after", (result.tac_after || []).join("\n")],
-                  ["Features", JSON.stringify(result.features, null, 2)],
-                  ["Passes run", (result.passes_run || []).join(", ")],
-                  ["Trace", JSON.stringify(result.trace)],
-                ].map(([t, c]) => (
-                  <Card key={t} title={t}>
-                    <pre className="max-h-60 overflow-auto whitespace-pre-wrap rounded-xl bg-slate-950 p-4 text-xs leading-5 text-slate-200">{c}</pre>
-                  </Card>
-                ))}
+                <div className="flex flex-col gap-3">
+                  {outputs.map(([t, c]) => (
+                    <Card key={t} title={t}>
+                      <pre className="max-h-48 overflow-auto whitespace-pre-wrap rounded-md bg-muted p-2 text-xs leading-5 text-foreground">
+                        {c}
+                      </pre>
+                    </Card>
+                  ))}
+                </div>
               </>
             )}
           </section>
-        </section>
+        </div>
       </main>
     </div>
   );

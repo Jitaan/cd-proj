@@ -99,18 +99,29 @@ def run_program(prog, inputs=None, max_steps=1_000_000, max_depth=1000):
             frame["locals"][name] = (ty or "i32", val)
 
     def array_ref(frame, base):
-        """Resolve `base` to (type, list) for array accesses. No hardcoded size."""
+        """Resolve `base` to (type, list) for array accesses. No hardcoded size.
+
+        A base may be a pointer variable whose value is the name of another
+        array/variable; follow that indirection.
+        """
         if not isinstance(base, str):
             raise RuntimeError("invalid array base")
-        if base in frame["locals"]:
-            ty, val = frame["locals"][base]
-        elif base in gvals:
-            ty, val = gtypes[base], gvals[base]
-        else:
-            raise RuntimeError("unknown array '%s'" % base)
-        if not isinstance(val, list):
-            raise RuntimeError("'%s' is not an array" % base)
-        return ty, val
+        seen = set()
+        cur = base
+        while True:
+            if cur in frame["locals"]:
+                ty, val = frame["locals"][cur]
+            elif cur in gvals:
+                ty, val = gtypes[cur], gvals[cur]
+            else:
+                raise RuntimeError("unknown array '%s'" % base)
+            if isinstance(val, str) and val != cur and val not in seen:
+                seen.add(cur)
+                cur = val
+                continue
+            if not isinstance(val, list):
+                raise RuntimeError("'%s' is not an array" % base)
+            return ty, val
 
     def check_index(ty, arr, index):
         if not isinstance(index, int):
@@ -154,6 +165,12 @@ def run_program(prog, inputs=None, max_steps=1_000_000, max_depth=1000):
             if ins.op == "copy":
                 v = get_val(frame, ins.arg1)
                 set_val(frame, ins.result, v)
+                frame["pc"] += 1
+            elif ins.op == "addr":
+                if isinstance(ins.arg1, str):
+                    set_val(frame, ins.result, ins.arg1)
+                else:
+                    set_val(frame, ins.result, get_val(frame, ins.arg1))
                 frame["pc"] += 1
             elif ins.op in ("neg", "not", "bnot"):
                 a = get_val(frame, ins.arg1)

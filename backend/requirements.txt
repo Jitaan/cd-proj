@@ -1,0 +1,7 @@
+# Runtime
+scikit-learn>=1.8.0
+streamlit>=1.53.1
+pandas>=2.2.3
+
+# Tests
+pytest>=9.1.1

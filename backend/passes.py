@@ -10,9 +10,18 @@ import cond_jump
 
 
 class PassContext:
-    def __init__(self, globals_set=None, var_types=None):
+    def __init__(self, globals_set=None, var_types=None, addr_taken=None):
         self.globals = globals_set or set()
         self.var_types = var_types or {}
+        # Names whose address is taken (`&x`, struct bases).  Their values can
+        # change through an aliasing pointer, so value propagation must not
+        # assume anything about them.
+        self.addr_taken = addr_taken or set()
+
+
+# Memory/aliasing barriers: a store through a pointer may change any variable
+# whose address was taken, so value propagation cannot look across these.
+MEMORY_OPS = (tac.STORE_OPS | tac.LOAD_OPS | tac.ADDRESS_OPS) | {"ptrdiff"}
 
 
 # Optimization pass order - carefully ordered for maximum effectiveness
@@ -72,6 +81,7 @@ def _with_dst(ins, dst): return ins._replace(result=dst)
 
 def _propagate_fold(instrs, ctx=None):
     """Constant propagation + folding + copy propagation"""
+    addr_taken = getattr(ctx, "addr_taken", set()) or set()
     blocks_list = split_blocks(instrs)
     new_blocks = []
     changes = 0
@@ -131,6 +141,11 @@ def _propagate_fold(instrs, ctx=None):
             elif op == "call":
                 env.clear()
                 ins2 = ins
+            elif op in MEMORY_OPS:
+                # A store/load/address may clobber any address-taken variable
+                # (and a load has an unknown value); drop all known values.
+                env.clear()
+                ins2 = ins
             elif op == "return":
                 a = env[_a(ins)] if (isinstance(_a(ins), str) and _a(ins) in env) else _a(ins)
                 ins2 = _with_a(ins, a) if ins.arg1 is not None else ins
@@ -147,7 +162,7 @@ def _propagate_fold(instrs, ctx=None):
                         del env[k]
                     if ins2.op == "copy":
                         a = ins2.arg1
-                        if isinstance(a, int) or (isinstance(a, str) and a != dst):
+                        if dst not in addr_taken and (isinstance(a, int) or (isinstance(a, str) and a != dst)):
                             env[dst] = a
                 out.append(ins2)
         new_blocks.append(out)

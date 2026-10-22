@@ -95,3 +95,35 @@
     @apply bg-background text-foreground font-sans antialiased;
   }
 }
+
+/* Dark scrollbars for every scrollable surface in the app (code editor,
+   TAC/result panes, dropdowns).  Chromium/Safari use the ::-webkit-scrollbar
+   pseudo-elements; Firefox uses the standard properties, scoped behind a
+   Firefox-only @supports because setting scrollbar-width/color in Chromium
+   makes it ignore ::-webkit-scrollbar and fall back to the OS light scrollbar. */
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background-color: var(--muted-foreground);
+  border-radius: 9999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background-color: var(--foreground);
+}
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+@supports (-moz-appearance: none) {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--muted-foreground) transparent;
+  }
+}

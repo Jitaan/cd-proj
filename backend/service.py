@@ -254,7 +254,9 @@ def _run_c(source, mode, passes_list):
         # optimize main function body
         from passes import optimise, PassContext
         fn = prog.main()
-        ctx = PassContext(globals_set=set(prog.globals.keys()), var_types=fn.var_types)
+        addr_taken = {i.arg1 for i in fn.body if i.op == "addr"}
+        ctx = PassContext(globals_set=set(prog.globals.keys()), var_types=fn.var_types,
+                          addr_taken=addr_taken)
         enabled = set() if mode == "none" else set(passes_list or [])
         if mode == "ai":
             try:

@@ -31,19 +31,6 @@ class CGenerator:
         self.label_n += 1
         return "L%d" % self.label_n
 
-    def _lvalue_name(self, base):
-        """Return the variable name for a simple lvalue, else None.
-
-        The parser represents `i++` as either a bare name string (statement
-        form) or an ("Ident", name[, loc]) node (expression form).
-        """
-        base = _skip_loc(base)
-        if isinstance(base, str):
-            return base
-        if isinstance(base, tuple) and base and base[0] == "Ident":
-            return base[1]
-        return None
-
     def _elem_type(self, base_ty):
         """The element type of an indexable base (array or pointer)."""
         if base_ty is None:
@@ -67,41 +54,238 @@ class CGenerator:
         fn.body.append(Instr("cast", addr, None, tmp, ty=dst_ty))
         return tmp
 
-    def gen_incdec(self, base, op, prefix, fn):
-        """Generate `++`/`--` for scalar or array-element lvalues.
-
-        Returns (address, type) of the resulting value: the new value for
-        prefix form, the old value for postfix form.
-        """
-        bop = "+" if op == "++" else "-"
-        name = self._lvalue_name(base)
-        if name is not None:
-            vty = fn.var_types.get(name, INT)
-            old = None
-            if not prefix:
-                old = self.new_temp()
-                fn.var_types[old] = vty
-                fn.body.append(Instr("copy", name, None, old, ty=vty))
+    def _emit_arith(self, op, a, a_ty, b, b_ty, fn):
+        """Emit `a op b`, scaling pointer arithmetic by the pointee size."""
+        ad = a_ty.decay() if isinstance(a_ty, Type) else a_ty
+        bd = b_ty.decay() if isinstance(b_ty, Type) else b_ty
+        ap = ad is not None and ad.kind == "pointer"
+        bp = bd is not None and bd.kind == "pointer"
+        if op in ("+", "-") and (ap or bp):
+            if ap and bp:
+                # pointer difference: element count
+                size = ad.pointee.size_bytes if ad.pointee else 1
+                ty = Type("scalar", bits=64, signed=True)
+                tmp = self.new_temp()
+                fn.var_types[tmp] = ty
+                fn.body.append(Instr("ptrdiff", a, b, tmp, args=(size,), ty=ty))
+                return tmp, ty
+            ptr_ty = ad if ap else bd
+            size = ptr_ty.pointee.size_bytes if ptr_ty.pointee else 1
+            if ap and op == "+":
+                idx = b
+            elif ap:  # ptr - int  -> ptr + (-int)
+                idx = self.new_temp()
+                fn.var_types[idx] = b_ty
+                fn.body.append(Instr("neg", b, None, idx, ty=b_ty))
+            else:  # int + ptr
+                a, idx = b, a
             tmp = self.new_temp()
-            fn.var_types[tmp] = vty
-            fn.body.append(Instr(bop, name, 1, tmp, ty=vty))
-            fn.body.append(Instr("copy", tmp, None, name, ty=vty))
-            return (tmp if prefix else old), vty
-        node = _skip_loc(base)
-        if isinstance(node, tuple) and node and node[0] == "Index":
-            arr_addr, arr_ty = self.gen_expr(node[1], fn)
-            idx_addr, idx_ty = self.gen_expr(node[2], fn)
-            elem_ty = self._elem_type(arr_ty)
-            old = self.new_temp()
-            fn.var_types[old] = elem_ty
-            fn.body.append(Instr("load", arr_addr, idx_addr, old, ty=elem_ty))
-            new = self.new_temp()
-            fn.var_types[new] = elem_ty
-            fn.body.append(Instr(bop, old, 1, new, ty=elem_ty))
-            fn.body.append(Instr("store", arr_addr, idx_addr, new, ty=elem_ty))
-            return (new if prefix else old), elem_ty
-        # Unsupported lvalue shape: evaluate for its side effects only.
-        return self.gen_expr(node, fn)
+            fn.var_types[tmp] = ptr_ty
+            fn.body.append(Instr("indexadd", a, idx, tmp, args=(size,), ty=ptr_ty))
+            return tmp, ptr_ty
+        ct = common_type(a_ty, b_ty)
+        a = self._cast_if_needed(a, a_ty, ct, fn)
+        b = self._cast_if_needed(b, b_ty, ct, fn)
+        tmp = self.new_temp()
+        fn.var_types[tmp] = ct
+        fn.body.append(Instr(op, a, b, tmp, ty=ct))
+        return tmp, ct
+
+    def gen_addr(self, node, fn):
+        """Return (address_operand, object_type) for an lvalue expression."""
+        node = _skip_loc(node)
+        kind = node[0]
+        if kind == "Ident":
+            name = node[1]
+            ty = fn.var_types.get(name, INT)
+            tmp = self.new_temp()
+            fn.var_types[tmp] = Type.pointer(ty)
+            fn.body.append(Instr("addr", name, None, tmp, ty=Type.pointer(ty)))
+            return tmp, ty
+        if kind == "Unary" and node[1] == "*":
+            a, t = self.gen_expr(node[2], fn)
+            ty = getattr(t, "pointee", None) or INT
+            return a, ty
+        if kind == "Index":
+            base, base_ty = self.gen_expr(node[1], fn)
+            idx, _ = self.gen_expr(node[2], fn)
+            elem_ty = self._elem_type(base_ty)
+            tmp = self.new_temp()
+            fn.var_types[tmp] = Type.pointer(elem_ty)
+            fn.body.append(Instr("indexadd", base, idx, tmp,
+                                 args=(elem_ty.size_bytes,), ty=Type.pointer(elem_ty)))
+            return tmp, elem_ty
+        if kind == "Member":
+            base_addr, _ = self.gen_addr(node[1], fn)
+            mty = node[4]
+            tmp = self.new_temp()
+            fn.var_types[tmp] = Type.pointer(mty)
+            fn.body.append(Instr("addoff", base_addr, node[3], tmp, ty=Type.pointer(mty)))
+            return tmp, mty
+        if kind == "Arrow":
+            ptr, _pt = self.gen_expr(node[1], fn)
+            mty = node[4]
+            tmp = self.new_temp()
+            fn.var_types[tmp] = Type.pointer(mty)
+            fn.body.append(Instr("addoff", ptr, node[3], tmp, ty=Type.pointer(mty)))
+            return tmp, mty
+        raise ValueError("not an lvalue: %r" % (node,))
+
+    def _load_at(self, addr, ty, fn):
+        """Load the object of type `ty` stored at address `addr`."""
+        tmp = self.new_temp()
+        fn.var_types[tmp] = ty
+        fn.body.append(Instr("loadoff", addr, 0, tmp, ty=ty))
+        return tmp
+
+    def gen_incdec(self, base, op, prefix, fn):
+        """Generate `++`/`--` for any lvalue shape.
+
+        Returns (address, type) of the resulting value: the new value for the
+        prefix form, the old value for the postfix form.
+        """
+        node = base
+        if isinstance(node, str):
+            node = ("Ident", node)
+        node = _skip_loc(node)
+        kind = node[0] if isinstance(node, tuple) and node else None
+        if kind == "Ident":
+            name = node[1]
+            ty = fn.var_types.get(name, INT)
+            get = lambda: (name, ty)
+            def put(v):
+                fn.body.append(Instr("copy", v, None, name, ty=ty))
+        elif kind == "Unary" and node[1] == "*":
+            ptr, pt = self.gen_expr(node[2], fn)
+            ty = getattr(pt, "pointee", None) or INT
+            get = lambda: (self._load_at(ptr, ty, fn), ty)
+            def put(v):
+                fn.body.append(Instr("store", ptr, 0, v, ty=ty))
+        elif kind == "Index":
+            base_op, bty = self.gen_expr(node[1], fn)
+            idx, _ = self.gen_expr(node[2], fn)
+            ty = self._elem_type(bty)
+            def get():
+                t = self.new_temp()
+                fn.var_types[t] = ty
+                fn.body.append(Instr("load", base_op, idx, t, ty=ty))
+                return t, ty
+            def put(v):
+                fn.body.append(Instr("store", base_op, idx, v, ty=ty))
+        elif kind in ("Member", "Arrow"):
+            addr, ty = self.gen_addr(node, fn)
+            get = lambda: (self._load_at(addr, ty, fn), ty)
+            def put(v):
+                fn.body.append(Instr("storeoff", addr, 0, v, ty=ty))
+        else:
+            return self.gen_expr(node, fn)
+
+        old, oty = get()
+        if not prefix:
+            res = self.new_temp()
+            fn.var_types[res] = oty
+            fn.body.append(Instr("copy", old, None, res, ty=oty))
+        else:
+            res = None
+        new = self.new_temp()
+        fn.var_types[new] = oty
+        if oty is not None and oty.kind == "pointer":
+            size = oty.pointee.size_bytes if oty.pointee else 1
+            delta = 1 if op == "++" else -1
+            fn.body.append(Instr("indexadd", old, delta, new, args=(size,), ty=oty))
+        else:
+            fn.body.append(Instr("+" if op == "++" else "-", old, 1, new, ty=oty))
+        put(new)
+        return (new if prefix else res), oty
+
+    def _gen_assign(self, lhs, rhs, op, fn):
+        """Generate an assignment to any lvalue shape."""
+        if isinstance(lhs, str):
+            lhs = ("Ident", lhs)
+        lhs = _skip_loc(lhs)
+        kind = lhs[0] if isinstance(lhs, tuple) and lhs else None
+
+        if kind == "Ident":
+            name = lhs[1]
+            ty = fn.var_types.get(name, INT)
+            if ty.is_record and op == "=":
+                dst, _ = self.gen_addr(lhs, fn)
+                src, _ = self.gen_addr(rhs, fn)
+                fn.body.append(Instr("blkcopy", dst, src, None,
+                                     args=(ty.size_bytes,), ty=ty))
+                return
+            val, vty = self.gen_expr(rhs, fn)
+            if op == "=":
+                val = self._cast_if_needed(val, vty, ty, fn)
+                fn.body.append(Instr("copy", val, None, name, ty=ty))
+            else:
+                res, _ = self._emit_arith(op[:-1], name, ty, val, vty, fn)
+                fn.body.append(Instr("copy", res, None, name, ty=ty))
+            return
+
+        if kind == "Index":
+            base, base_ty = self.gen_expr(lhs[1], fn)
+            idx, _ = self.gen_expr(lhs[2], fn)
+            ty = self._elem_type(base_ty)
+            if ty.is_record and op == "=":
+                dst = self.new_temp()
+                fn.var_types[dst] = Type.pointer(ty)
+                fn.body.append(Instr("indexadd", base, idx, dst,
+                                     args=(ty.size_bytes,), ty=Type.pointer(ty)))
+                src, _ = self.gen_addr(rhs, fn)
+                fn.body.append(Instr("blkcopy", dst, src, None,
+                                     args=(ty.size_bytes,), ty=ty))
+                return
+            val, vty = self.gen_expr(rhs, fn)
+            if op == "=":
+                val = self._cast_if_needed(val, vty, ty, fn)
+                fn.body.append(Instr("store", base, idx, val, ty=ty))
+            else:
+                old = self.new_temp()
+                fn.var_types[old] = ty
+                fn.body.append(Instr("load", base, idx, old, ty=ty))
+                res, _ = self._emit_arith(op[:-1], old, ty, val, vty, fn)
+                fn.body.append(Instr("store", base, idx, res, ty=ty))
+            return
+
+        if kind == "Unary" and lhs[1] == "*":
+            ptr, pt = self.gen_expr(lhs[2], fn)
+            ty = getattr(pt, "pointee", None) or INT
+            if ty.is_record and op == "=":
+                src, _ = self.gen_addr(rhs, fn)
+                fn.body.append(Instr("blkcopy", ptr, src, None,
+                                     args=(ty.size_bytes,), ty=ty))
+                return
+            val, vty = self.gen_expr(rhs, fn)
+            if op == "=":
+                val = self._cast_if_needed(val, vty, ty, fn)
+                fn.body.append(Instr("store", ptr, 0, val, ty=ty))
+            else:
+                old = self.new_temp()
+                fn.var_types[old] = ty
+                fn.body.append(Instr("load", ptr, 0, old, ty=ty))
+                res, _ = self._emit_arith(op[:-1], old, ty, val, vty, fn)
+                fn.body.append(Instr("store", ptr, 0, res, ty=ty))
+            return
+
+        if kind in ("Member", "Arrow"):
+            addr, ty = self.gen_addr(lhs, fn)
+            if ty.is_record and op == "=":
+                src, _ = self.gen_addr(rhs, fn)
+                fn.body.append(Instr("blkcopy", addr, src, None,
+                                     args=(ty.size_bytes,), ty=ty))
+                return
+            val, vty = self.gen_expr(rhs, fn)
+            if op == "=":
+                val = self._cast_if_needed(val, vty, ty, fn)
+                fn.body.append(Instr("storeoff", addr, 0, val, ty=ty))
+            else:
+                old = self._load_at(addr, ty, fn)
+                res, _ = self._emit_arith(op[:-1], old, ty, val, vty, fn)
+                fn.body.append(Instr("storeoff", addr, 0, res, ty=ty))
+            return
+
+        raise ValueError("unsupported assignment target %r" % (lhs,))
 
     def generate(self, tu):
         prog = Program()
@@ -141,9 +325,10 @@ class CGenerator:
             fn.var_types[uniq] = pty
         # body
         self.gen_block(body_node, fn)
-        # implicit return
+        # implicit return, unless the body already ends by returning
         if ret_ty is not None and not ret_ty.is_void:
-            fn.body.append(Instr("return", 0, None, None, ty=ret_ty))
+            if not fn.body or fn.body[-1].op != "return":
+                fn.body.append(Instr("return", 0, None, None, ty=ret_ty))
         return fn
 
     def gen_block(self, node, fn):
@@ -186,11 +371,16 @@ class CGenerator:
             fn.var_types[name] = ty
             init = node[3]
             if init is None:
-                # Don't initialize arrays to 0 - in C, arrays are not zero-initialized by default
-                if not ty.is_array:
+                # Aggregates (arrays/records) are not zero-initialized by default.
+                if not ty.is_aggregate:
                     fn.body.append(Instr("copy", 0, None, name, ty=ty))
             elif init[0] == "InitList":
                 self._gen_init_list(init[1], name, ty, fn)
+            elif ty.is_record:
+                dst, _ = self.gen_addr(("Ident", name), fn)
+                src, _ = self.gen_addr(init, fn)
+                fn.body.append(Instr("blkcopy", dst, src, None,
+                                     args=(ty.size_bytes,), ty=ty))
             else:
                 addr, t = self.gen_expr(init, fn)
                 addr = self._cast_if_needed(addr, t, ty, fn)
@@ -198,42 +388,7 @@ class CGenerator:
         elif kind == "ExprStmt":
             e = _skip_loc(node[1])
             if e[0] == "Assign":
-                op = e[1]; lhs = e[2]; expr = e[3]
-                # Handle array assignment (lhs is Index node)
-                if lhs[0] == "Index":
-                    base = lhs[1]
-                    idx = lhs[2]
-                    base_addr, base_ty = self.gen_expr(base, fn)
-                    idx_addr, idx_ty = self.gen_expr(idx, fn)
-                    val_addr, val_ty = self.gen_expr(expr, fn)
-                    elem_ty = self._elem_type(base_ty)
-                    val_addr = self._cast_if_needed(val_addr, val_ty, elem_ty, fn)
-                    if op != "=":
-                        # Compound assignment: a[i] op= value -> load, op, store
-                        old = self.new_temp()
-                        fn.var_types[old] = elem_ty
-                        fn.body.append(Instr("load", base_addr, idx_addr, old, ty=elem_ty))
-                        new = self.new_temp()
-                        fn.var_types[new] = elem_ty
-                        fn.body.append(Instr(op[:-1], old, val_addr, new, ty=elem_ty))
-                        val_addr = new
-                    fn.body.append(Instr("store", base_addr, idx_addr, val_addr, ty=elem_ty))
-                else:
-                    # Regular variable assignment
-                    name = self._lvalue_name(lhs)
-                    if name is None:
-                        raise ValueError("unsupported assignment target %r" % (lhs,))
-                    addr, t = self.gen_expr(expr, fn)
-                    vty = fn.var_types.get(name, INT)
-                    addr = self._cast_if_needed(addr, t, vty, fn)
-                    if op == "=":
-                        fn.body.append(Instr("copy", addr, None, name, ty=vty))
-                    else:
-                        bop = op[:-1]  # "+=" -> "+", etc.
-                        tmp = self.new_temp()
-                        fn.var_types[tmp] = vty
-                        fn.body.append(Instr(bop, name, addr, tmp, ty=vty))
-                        fn.body.append(Instr("copy", tmp, None, name, ty=vty))
+                self._gen_assign(e[2], e[3], e[1], fn)
             elif e[0] == "IncDec":
                 self.gen_incdec(e[3], e[1], e[2], fn)
             else:
@@ -365,7 +520,19 @@ class CGenerator:
         return 0
 
     def _gen_init_list(self, items, name, ty, fn):
-        """Initialise an array from a brace-enclosed list of values."""
+        """Initialise an aggregate from a brace-enclosed list of values."""
+        if ty.kind == "record":
+            base = self.new_temp()
+            fn.var_types[base] = Type.pointer(ty)
+            fn.body.append(Instr("addr", name, None, base, ty=Type.pointer(ty)))
+            for i, item in enumerate(items):
+                if i >= len(ty.members):
+                    break
+                m = ty.members[i]
+                addr, t = self.gen_expr(item, fn)
+                addr = self._cast_if_needed(addr, t, m.type, fn)
+                fn.body.append(Instr("storeoff", base, m.offset, addr, ty=m.type))
+            return
         elem_ty = ty.elem if ty.kind == "array" else INT
         for i, item in enumerate(items):
             addr, t = self.gen_expr(item, fn)
@@ -393,40 +560,33 @@ class CGenerator:
             name = node[1]
             return name, fn.var_types.get(name, INT)
         if kind == "Unary":
+            op = node[1]
+            if op == "&":
+                addr, ty = self.gen_addr(node[2], fn)
+                return addr, Type.pointer(ty)
             addr, t = self.gen_expr(node[2], fn)
+            if op == "*":
+                elem_ty = getattr(t, "pointee", None) or t
+                if elem_ty.is_aggregate:
+                    return addr, elem_ty
+                tmp = self.new_temp()
+                fn.var_types[tmp] = elem_ty
+                fn.body.append(Instr("load", addr, 0, tmp, ty=elem_ty))
+                return tmp, elem_ty
             tmp = self.new_temp()
             fn.var_types[tmp] = t
-            op = node[1]
             if op == "-":
                 fn.body.append(Instr("neg", addr, None, tmp, ty=t))
             elif op == "!":
                 fn.body.append(Instr("not", addr, None, tmp, ty=t))
             elif op == "~":
                 fn.body.append(Instr("bnot", addr, None, tmp, ty=t))
-            elif op == "*":
-                pt = t
-                elem_ty = getattr(pt, "pointee", None)
-                if elem_ty is None:
-                    elem_ty = t
-                fn.var_types[tmp] = elem_ty
-                fn.body.append(Instr("load", addr, 0, tmp, ty=elem_ty))
-            elif op == "&":
-                pt = Type.pointer(t) if not (isinstance(t, Type) and t.kind == "pointer") else t
-                fn.var_types[tmp] = pt
-                fn.body.append(Instr("addr", addr, None, tmp, ty=pt))
             return tmp, t
         if kind == "BinOp":
             op = node[1]
             la, lt = self.gen_expr(node[2], fn)
             ra, rt = self.gen_expr(node[3], fn)
-            # cast to common type
-            ct = common_type(lt, rt)
-            la = self._cast_if_needed(la, lt, ct, fn)
-            ra = self._cast_if_needed(ra, rt, ct, fn)
-            tmp = self.new_temp()
-            fn.var_types[tmp] = ct
-            fn.body.append(Instr(op, la, ra, tmp, ty=ct))
-            return tmp, ct
+            return self._emit_arith(op, la, lt, ra, rt, fn)
         if kind == "Cast":
             ty = node[1]
             addr, t = self.gen_expr(node[2], fn)
@@ -466,18 +626,26 @@ class CGenerator:
         if kind == "IncDec":
             return self.gen_incdec(node[3], node[1], node[2], fn)
         if kind == "Index":
-            # array subscript: base[index]
+            # array/pointer subscript: base[index]
             base, base_ty = self.gen_expr(node[1], fn)
             idx, idx_ty = self.gen_expr(node[2], fn)
             elem_ty = self._elem_type(base_ty)
+            if elem_ty.is_aggregate:
+                tmp = self.new_temp()
+                fn.var_types[tmp] = Type.pointer(elem_ty)
+                fn.body.append(Instr("indexadd", base, idx, tmp,
+                                     args=(elem_ty.size_bytes,), ty=Type.pointer(elem_ty)))
+                return tmp, elem_ty
             tmp = self.new_temp()
             fn.var_types[tmp] = elem_ty
             fn.body.append(Instr("load", base, idx, tmp, ty=elem_ty))
             return tmp, elem_ty
-        if kind == "Arrow":
-            raise ValueError("pointer member access is not supported yet")
-        if kind == "Member":
-            raise ValueError("record member access is not supported yet")
+        if kind in ("Arrow", "Member"):
+            addr, ty = self.gen_addr(node, fn)
+            if ty.is_aggregate:
+                return addr, ty
+            tmp = self._load_at(addr, ty, fn)
+            return tmp, ty
         raise ValueError("unknown expr %s" % kind)
 
 

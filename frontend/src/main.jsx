@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import ReactDOM from "react-dom/client";
 import "./index.css";
 
@@ -24,6 +24,21 @@ function App() {
   const [lang, setLang] = useState("c");
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
+  const sourceRef = useRef(null);
+
+  const handleSourceKeyDown = (e) => {
+    if (e.key !== "Tab") return;
+    e.preventDefault();
+    const ta = sourceRef.current;
+    if (!ta) return;
+    const start = ta.selectionStart;
+    const end = ta.selectionEnd;
+    const next = source.slice(0, start) + "    " + source.slice(end);
+    setSource(next);
+    requestAnimationFrame(() => {
+      ta.selectionStart = ta.selectionEnd = start + 4;
+    });
+  };
 
   useEffect(() => {
     fetch(API + "/api/examples").then(r => r.json()).then(setExamples).catch(() => {});
@@ -112,8 +127,10 @@ function App() {
               </div>
               <textarea
                 aria-label="MiniC source code"
+                ref={sourceRef}
                 value={source}
                 onChange={(e) => setSource(e.target.value)}
+                onKeyDown={handleSourceKeyDown}
                 rows={18}
                 placeholder="Write or select a MiniC program to optimize..."
                 className="w-full resize-y rounded-md border border-input bg-background p-3 font-mono text-sm leading-6 text-foreground outline-none placeholder:text-muted-foreground transition focus:border-ring focus:ring-2 focus:ring-ring/40"

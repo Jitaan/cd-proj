@@ -5,6 +5,11 @@ import blocks
 import tac
 
 
+# A store/load/address may clobber any address-taken variable, and a load has
+# an unknown value, so copy propagation cannot look across memory operations.
+_MEMORY_OPS = (tac.STORE_OPS | tac.LOAD_OPS | tac.ADDRESS_OPS) | {"ptrdiff"}
+
+
 def _copy_prop_block(block):
     """Propagate copies within a single basic block"""
     env = {}  # var -> source
@@ -26,6 +31,11 @@ def _copy_prop_block(block):
                 while src in env and isinstance(env[src], str) and env[src] != src:
                     src = env[src]
                 env[dst] = src
+            out.append(ins)
+            continue
+
+        if op in _MEMORY_OPS:
+            env.clear()
             out.append(ins)
             continue
         

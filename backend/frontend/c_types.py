@@ -224,6 +224,16 @@ def layout_record(name, member_types, is_union=False):
     return t
 
 
+def member_of(record_ty, name, line=0, col=0):
+    """Look up a member of a record type; raise SemanticError if absent."""
+    if record_ty is None or record_ty.kind != "record":
+        raise SemanticError(line, col, "member access on non-record type")
+    for m in record_ty.members:
+        if m.name == name:
+            return m
+    raise SemanticError(line, col, "no member %r in %s" % (name, record_ty.tag))
+
+
 def parse_type_specifiers(specs):
     """Build a Type from a list of C type-specifier keywords."""
     allowed = {"char", "short", "int", "long", "unsigned", "signed", "void", "const"}

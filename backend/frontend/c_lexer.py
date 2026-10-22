@@ -9,6 +9,7 @@ class CLexError(Exception):
         super().__init__("%d:%d: %s" % (line, col, msg))
 
 KEYWORDS = {"int","char","short","long","unsigned","signed","void","const",
+            "struct","union",
             "if","else","while","do","for","break","continue","return",
             "printf","scanf","putchar"}
 

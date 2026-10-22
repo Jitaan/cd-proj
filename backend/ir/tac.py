@@ -196,6 +196,17 @@ def has_side_effect(instr):
         return True
     return False
 
+def _escape_str(s):
+    """Escape control characters so a string literal prints on one line."""
+    if not isinstance(s, str):
+        return s
+    return (s.replace("\\", "\\\\")
+             .replace("\n", "\\n")
+             .replace("\r", "\\r")
+             .replace("\t", "\\t")
+             .replace('"', '\\"'))
+
+
 def instr_str(i):
     op = i.op
     if op == "label": return "%s:" % i.arg1
@@ -203,7 +214,7 @@ def instr_str(i):
     if op == "ifFalse": return "ifFalse %s goto %s" % (i.arg1, i.arg2)
     if op == "if": return "if %s %s %s goto %s" % (i.arg1, i.op_relop, i.arg2, i.result)
     if op == "print": return "print %s" % i.arg1
-    if op == "out_str": return 'out_str "%s"' % i.arg1
+    if op == "out_str": return 'out_str "%s"' % _escape_str(i.arg1)
     if op == "out_val": return "out_val %s, %s" % (i.arg1, i.arg2)
     if op == "read": return "read %s" % i.result
     if op == "return":
@@ -215,7 +226,7 @@ def instr_str(i):
         return "call %s(%s)" % (i.arg1, args)
     if op == "param":
         if getattr(i, "ty", None) == "str":
-            return 'param "%s"' % i.arg1
+            return 'param "%s"' % _escape_str(i.arg1)
         return "param %s" % i.arg1
     if op == "cast": return "%s = (%s) %s" % (i.result, i.ty, i.arg1)
     if op == "load": return "%s = %s[%s]" % (i.result, i.arg1, i.arg2)

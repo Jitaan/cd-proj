@@ -1,7 +1,16 @@
-﻿# ir/interpreter.py - multi-function interpreter (C1+C2)
+﻿# ir/interpreter.py - multi-function interpreter (address-based memory model)
+#
+# Variables live in a flat, byte-addressed memory.  Each variable (global or
+# local) is given a base address by a bump allocator; the per-frame symbol
+# table maps a name to (base_address, Type).  Values are read/written through
+# that address, which is what makes real pointers (integers) possible.
+#
+# Temporaries (`tN`, a namespace the lexer reserves) are plain Python values:
+# their address is never taken, so they do not need storage.
 
 import re
 from dataclasses import dataclass
+
 
 @dataclass
 class RunResult:
@@ -19,116 +28,184 @@ class RunResult:
         if self.func_steps is None: self.func_steps = {}
 
 
+_TEMP_RE = re.compile(r"t\d+")
+_IDENT_RE = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*")
+
+
+def _is_temp(name):
+    return isinstance(name, str) and _TEMP_RE.fullmatch(name) is not None
+
+
+def _ty_size(ty):
+    """Byte width of a value of type `ty` (Type object or legacy tag)."""
+    from frontend.c_types import Type
+    if isinstance(ty, Type):
+        if ty.kind == "pointer":
+            return 8
+        if ty.kind == "void":
+            return 1
+        if ty.kind in ("array", "record"):
+            return max(1, ty.size_bytes)
+        return max(1, ty.size_bytes)
+    if isinstance(ty, str):
+        if ty == "ptr":
+            return 8
+        if len(ty) >= 2 and ty[0] in "iu" and ty[1:].isdigit():
+            return max(1, int(ty[1:]) // 8)
+    return 4
+
+
+def _ty_signed(ty):
+    from frontend.c_types import Type
+    if isinstance(ty, Type):
+        if ty.kind == "scalar":
+            return ty.signed
+        if ty.kind == "pointer":
+            return False
+        return True
+    if isinstance(ty, str) and len(ty) >= 2 and ty[0] in "iu":
+        return ty[0] == "i"
+    return True
+
+
+def _align_up(n, a):
+    if a <= 1:
+        return n
+    return (n + a - 1) // a * a
+
+
 def run_program(prog, inputs=None, max_steps=1_000_000, max_depth=1000):
     if inputs is None: inputs = []
-    from ir.tac import eval_binary, eval_unary, wrap, uses, defs
-    from ir.program import default_value, is_array_type
-    inp_idx = [0]
-    globals_ = {name: (ty, val) for name, (ty, val) in prog.globals.items()}
-    gtypes = {name: ty for name, (ty, val) in prog.globals.items()}
-    gvals = {}
-    for name, (ty, val) in prog.globals.items():
-        if is_array_type(ty):
-            arr = default_value(ty)
-            if isinstance(val, list):
-                n = ty.count or 0
-                for i in range(min(n, len(val))):
-                    arr[i] = val[i]
-            gvals[name] = arr
-        else:
-            gvals[name] = val
+    from frontend.c_types import Type
+    from ir.tac import eval_binary, wrap
 
+    inp_idx = [0]
     result = RunResult()
-    # frame-based execution
-    # We'll do iterative with explicit call stack
-    # Each frame: {func_name, pc, locals dict, ret_var}
+
+    # -- flat memory + allocator -------------------------------------
+    mem = {}
+    bump = [4096]
+
+    def alloc(size, align=1):
+        base = _align_up(bump[0], max(1, align))
+        bump[0] = base + max(1, size)
+        return base
+
+    def _size_align(ty):
+        if isinstance(ty, Type):
+            return max(1, ty.size_bytes), max(1, ty.align)
+        return _ty_size(ty), 1
+
+    def read_obj(addr, ty):
+        size = _ty_size(ty)
+        v = 0
+        for i in range(size):
+            v |= mem.get(addr + i, 0) << (8 * i)
+        if _ty_signed(ty) and v >= (1 << (size * 8 - 1)):
+            v -= (1 << (size * 8))
+        return v
+
+    def write_obj(addr, val, ty):
+        if not isinstance(val, int) or isinstance(val, bool):
+            val = int(val) if isinstance(val, bool) else 0
+        size = _ty_size(ty)
+        v = val & ((1 << (size * 8)) - 1)
+        for i in range(size):
+            mem[addr + i] = (v >> (8 * i)) & 0xFF
+
+    def write_value(addr, ty, val):
+        """Initialise a variable (possibly an aggregate) at `addr`."""
+        if isinstance(ty, Type) and ty.kind == "array":
+            es = ty.elem
+            step = max(1, es.size_bytes)
+            for i in range(ty.count or 0):
+                item = val[i] if isinstance(val, list) and i < len(val) else 0
+                write_value(addr + i * step, es, item)
+        elif isinstance(ty, Type) and ty.kind == "record":
+            return  # zero-initialised; member offsets handled by codegen
+        else:
+            write_obj(addr, val if isinstance(val, int) else 0, ty)
+
+    # -- globals -----------------------------------------------------
+    gsyms = {}
+    for name, (ty, val) in prog.globals.items():
+        size, align = _size_align(ty)
+        base = alloc(size, align)
+        gsyms[name] = (base, ty)
+        write_value(base, ty, val)
+
+    # -- frames ------------------------------------------------------
     call_stack = []
-    # start main
     main_fn = prog.main()
     if main_fn is None:
         result.error = "no main"
         return result
 
     def make_frame(fn, args):
-        locals_ = {}
+        syms = {}
+        uninit = set()
         for (pname, pty), aval in zip(fn.params, args):
-            locals_[pname] = (pty, aval)
+            size, align = _size_align(pty)
+            base = alloc(size, align)
+            syms[pname] = (base, pty)
+            if isinstance(aval, int):
+                write_obj(base, aval, pty)
         for v, ty in fn.var_types.items():
-            if v not in locals_:
-                if is_array_type(ty):
-                    locals_[v] = (ty, default_value(ty))
-                else:
-                    locals_[v] = (ty, None)  # uninitialized
-        return {"fn": fn, "pc": 0, "locals": locals_, "ret": None}
+            if _is_temp(v) or v in syms:
+                continue
+            size, align = _size_align(ty)
+            base = alloc(size, align)
+            syms[v] = (base, ty)
+            if not (isinstance(ty, Type) and ty.kind in ("array", "record")):
+                uninit.add(v)
+        return {"fn": fn, "pc": 0, "syms": syms, "temps": {}, "uninit": uninit,
+                "ret": None, "_params": []}
 
-    # initialize globals as defined
-    frame = make_frame(main_fn, [])
-    # bind args? main has no args
-    call_stack.append(frame)
+    def sym_base(frame, name):
+        if name in frame["syms"]:
+            return frame["syms"][name][0]
+        if name in gsyms:
+            return gsyms[name][0]
+        return None
 
-    # helper to get value
     def get_val(frame, operand):
         if isinstance(operand, int):
             return operand
         if isinstance(operand, str):
-            # check locals first: names may contain dots (scope-unique names)
-            if operand in frame["locals"]:
-                ty, val = frame["locals"][operand]
-                if val is None:
+            if _is_temp(operand):
+                if operand not in frame["temps"]:
                     raise RuntimeError("undefined_var")
-                return val
-            # globals
-            if operand in gvals:
-                return gvals[operand]
-            # Identifiers that are not declared are errors; anything else
-            # (e.g. a printf format string) is a literal.  fullmatch, not
-            # match: `$` would let a trailing newline through and make the
-            # format string "ok\n" look like an identifier.
-            if re.fullmatch(r'[a-zA-Z_][a-zA-Z0-9_]*', operand):
+                return frame["temps"][operand]
+            if operand in frame["syms"]:
+                base, ty = frame["syms"][operand]
+            elif operand in gsyms:
+                base, ty = gsyms[operand]
+            else:
+                # anything that is not a declared name is a literal (e.g. a
+                # printf format string); a bare identifier is an error.
+                if _IDENT_RE.fullmatch(operand):
+                    raise RuntimeError("undefined_var")
+                return operand
+            if isinstance(ty, Type) and ty.kind in ("array", "record"):
+                return base  # arrays/records decay to their address
+            if operand in frame["uninit"]:
                 raise RuntimeError("undefined_var")
-            return operand
+            return read_obj(base, ty)
         return operand
 
     def set_val(frame, name, val, ty=None):
-        if name in frame["locals"]:
-            t = frame["locals"][name][0]
-            frame["locals"][name] = (t, _wrap_value(val, t))
-        elif name in gvals:
-            gvals[name] = _wrap_value(val, gtypes[name])
+        if _is_temp(name) or (name not in frame["syms"] and name not in gsyms):
+            frame["temps"][name] = val
+            return
+        if name in frame["syms"]:
+            base, t = frame["syms"][name]
         else:
-            frame["locals"][name] = (ty or "i32", val)
+            base, t = gsyms[name]
+        write_obj(base, val, t)
+        frame["uninit"].discard(name)
 
-    def array_ref(frame, base):
-        """Resolve `base` to (type, list) for array accesses. No hardcoded size.
-
-        A base may be a pointer variable whose value is the name of another
-        array/variable; follow that indirection.
-        """
-        if not isinstance(base, str):
-            raise RuntimeError("invalid array base")
-        seen = set()
-        cur = base
-        while True:
-            if cur in frame["locals"]:
-                ty, val = frame["locals"][cur]
-            elif cur in gvals:
-                ty, val = gtypes[cur], gvals[cur]
-            else:
-                raise RuntimeError("unknown array '%s'" % base)
-            if isinstance(val, str) and val != cur and val not in seen:
-                seen.add(cur)
-                cur = val
-                continue
-            if not isinstance(val, list):
-                raise RuntimeError("'%s' is not an array" % base)
-            return ty, val
-
-    def check_index(ty, arr, index):
-        if not isinstance(index, int):
-            raise RuntimeError("non-integer array index")
-        if index < 0 or index >= len(arr):
-            raise RuntimeError("array index %d out of bounds for %s" % (index, ty))
-        return index
+    # start main
+    call_stack.append(make_frame(main_fn, []))
 
     steps = 0
     while call_stack:
@@ -136,19 +213,14 @@ def run_program(prog, inputs=None, max_steps=1_000_000, max_depth=1000):
         fn = frame["fn"]
         body = fn.body
         if frame["pc"] >= len(body):
-            # fall off end
             if fn.name == "main":
                 result.exit_code = 0
             call_stack.pop()
-            if call_stack:
-                # return to caller: set return value? handled by call instr
-                pass
             continue
         if len(call_stack) > max_depth:
             result.error = "stack_overflow"
             break
         ins = body[frame["pc"]]
-        # label
         if ins.op == "label":
             frame["pc"] += 1
             continue
@@ -157,93 +229,98 @@ def run_program(prog, inputs=None, max_steps=1_000_000, max_depth=1000):
             result.error = "step_limit"
             break
         result.steps = steps
-        # count
         result.op_counts[ins.op] = result.op_counts.get(ins.op, 0) + 1
         result.func_steps[fn.name] = result.func_steps.get(fn.name, 0) + 1
 
         try:
-            if ins.op == "copy":
-                v = get_val(frame, ins.arg1)
+            op = ins.op
+            if op == "copy":
+                set_val(frame, ins.result, get_val(frame, ins.arg1))
+                frame["pc"] += 1
+            elif op == "addr":
+                base = sym_base(frame, ins.arg1)
+                if base is None:
+                    raise RuntimeError("address of unknown '%s'" % ins.arg1)
+                set_val(frame, ins.result, base)
+                frame["pc"] += 1
+            elif op in ("neg", "not", "bnot"):
+                a = get_val(frame, ins.arg1)
+                if op == "neg": v = wrap(-a, ins.ty or "i32")
+                elif op == "not": v = 0 if a != 0 else 1
+                else: v = wrap(~a, ins.ty or "i32")
                 set_val(frame, ins.result, v)
                 frame["pc"] += 1
-            elif ins.op == "addr":
-                if isinstance(ins.arg1, str):
-                    set_val(frame, ins.result, ins.arg1)
-                else:
-                    set_val(frame, ins.result, get_val(frame, ins.arg1))
-                frame["pc"] += 1
-            elif ins.op in ("neg", "not", "bnot"):
-                a = get_val(frame, ins.arg1)
-                if ins.op == "neg": v = -a
-                elif ins.op == "not": v = 0 if a != 0 else 1
-                else: v = ~a
-                ty = ins.ty or "i32"
-                from ir.tac import wrap
-                set_val(frame, ins.result, wrap(v, ty))
-                frame["pc"] += 1
-            elif ins.op in ("+", "-", "*", "/", "%", "<", ">", "<=", ">=", "==", "!=",
-                            "&&", "||", "&", "|", "^", "<<", ">>", "shl"):
+            elif op in ("+", "-", "*", "/", "%", "<", ">", "<=", ">=", "==", "!=",
+                        "&&", "||", "&", "|", "^", "<<", ">>", "shl"):
                 a = get_val(frame, ins.arg1)
                 b = get_val(frame, ins.arg2)
-                from ir.tac import eval_binary
-                r, err = eval_binary(ins.op, a, b, ins.ty or "i32")
+                r, err = eval_binary(op, a, b, ins.ty or "i32")
                 if err:
                     result.error = err
                     break
                 set_val(frame, ins.result, r)
                 frame["pc"] += 1
-            elif ins.op == "cast":
-                v = get_val(frame, ins.arg1)
-                from ir.tac import wrap
-                set_val(frame, ins.result, wrap(v, ins.ty or "i32"))
+            elif op == "cast":
+                set_val(frame, ins.result, wrap(get_val(frame, ins.arg1), ins.ty or "i32"))
                 frame["pc"] += 1
-            elif ins.op == "store":
-                # store base, index, value (value travels in `result`)
-                base_name = ins.arg1
-                index = get_val(frame, ins.arg2)
-                value = get_val(frame, ins.result)
-                arr_ty, arr_val = array_ref(frame, base_name)
-                arr_val[check_index(arr_ty, arr_val, index)] = value
+            elif op == "load":
+                base = get_val(frame, ins.arg1)
+                idx = get_val(frame, ins.arg2)
+                addr = base + idx * _ty_size(ins.ty)
+                set_val(frame, ins.result, read_obj(addr, ins.ty))
                 frame["pc"] += 1
-            elif ins.op == "load":
-                # load base[index] -> result
-                base_name = ins.arg1
-                index = get_val(frame, ins.arg2)
-                arr_ty, arr_val = array_ref(frame, base_name)
-                value = arr_val[check_index(arr_ty, arr_val, index)]
-                set_val(frame, ins.result, value)
+            elif op == "store":
+                base = get_val(frame, ins.arg1)
+                idx = get_val(frame, ins.arg2)
+                write_obj(base + idx * _ty_size(ins.ty), get_val(frame, ins.result), ins.ty)
                 frame["pc"] += 1
-            elif ins.op == "goto":
-                # find label in current function body
+            elif op == "loadoff":
+                addr = get_val(frame, ins.arg1) + get_val(frame, ins.arg2)
+                set_val(frame, ins.result, read_obj(addr, ins.ty))
+                frame["pc"] += 1
+            elif op == "storeoff":
+                addr = get_val(frame, ins.arg1) + get_val(frame, ins.arg2)
+                write_obj(addr, get_val(frame, ins.result), ins.ty)
+                frame["pc"] += 1
+            elif op == "addoff":
+                set_val(frame, ins.result, get_val(frame, ins.arg1) + get_val(frame, ins.arg2))
+                frame["pc"] += 1
+            elif op == "indexadd":
+                scale = (ins.args or (1,))[0]
+                v = get_val(frame, ins.arg1) + get_val(frame, ins.arg2) * scale
+                set_val(frame, ins.result, v)
+                frame["pc"] += 1
+            elif op == "ptrdiff":
+                scale = (ins.args or (1,))[0] or 1
+                v = (get_val(frame, ins.arg1) - get_val(frame, ins.arg2)) // scale
+                set_val(frame, ins.result, v)
+                frame["pc"] += 1
+            elif op == "blkcopy":
+                n = (ins.args or (0,))[0]
+                dst = get_val(frame, ins.arg1)
+                src = get_val(frame, ins.arg2)
+                for i in range(n):
+                    mem[dst + i] = mem.get(src + i, 0)
+                frame["pc"] += 1
+            elif op == "goto":
                 target = None
                 for idx, x in enumerate(body):
                     if x.op == "label" and x.arg1 == ins.arg1:
                         target = idx
                         break
                 frame["pc"] = target
-            elif ins.op == "if":
-                # if x relop y goto L
+            elif op == "if":
                 a = get_val(frame, ins.arg1)
                 b = get_val(frame, ins.arg2)
                 target_label = ins.result
                 relop = ins.op_relop
-                
-                # Evaluate the condition
-                if relop == "<":
-                    cond = a < b
-                elif relop == ">":
-                    cond = a > b
-                elif relop == "<=":
-                    cond = a <= b
-                elif relop == ">=":
-                    cond = a >= b
-                elif relop == "==":
-                    cond = a == b
-                elif relop == "!=":
-                    cond = a != b
-                else:
-                    raise ValueError("unknown relop %s" % relop)
-                
+                if relop == "<": cond = a < b
+                elif relop == ">": cond = a > b
+                elif relop == "<=": cond = a <= b
+                elif relop == ">=": cond = a >= b
+                elif relop == "==": cond = a == b
+                elif relop == "!=": cond = a != b
+                else: raise ValueError("unknown relop %s" % relop)
                 if cond:
                     target = None
                     for idx, x in enumerate(body):
@@ -253,7 +330,7 @@ def run_program(prog, inputs=None, max_steps=1_000_000, max_depth=1000):
                     frame["pc"] = target
                 else:
                     frame["pc"] += 1
-            elif ins.op == "ifFalse":
+            elif op == "ifFalse":
                 c = get_val(frame, ins.arg1)
                 if c == 0:
                     target = None
@@ -264,69 +341,48 @@ def run_program(prog, inputs=None, max_steps=1_000_000, max_depth=1000):
                     frame["pc"] = target
                 else:
                     frame["pc"] += 1
-            elif ins.op == "print":
+            elif op == "print":
                 v = get_val(frame, ins.arg1)
                 result.output.append(v)
                 result.stdout += str(v) + "\n"
                 frame["pc"] += 1
-            elif ins.op == "out_str":
+            elif op == "out_str":
                 result.stdout += str(ins.arg1)
                 frame["pc"] += 1
-            elif ins.op == "out_val":
+            elif op == "out_val":
                 v = get_val(frame, ins.arg1)
-                spec = ins.arg2 or "d"
-                # format
-                s = _format_val(v, spec, ins.ty or "i32")
-                result.stdout += s
+                result.stdout += _format_val(v, ins.arg2 or "d", ins.ty or "i32")
                 frame["pc"] += 1
-            elif ins.op == "read":
+            elif op == "read":
                 if inp_idx[0] >= len(inputs):
                     result.error = "input_exhausted"
                     break
                 val = inputs[inp_idx[0]]
                 inp_idx[0] += 1
-                ty = ins.ty or "i32"
-                from ir.tac import wrap
-                set_val(frame, ins.result, wrap(val, ty))
+                set_val(frame, ins.result, wrap(val, ins.ty or "i32"))
                 frame["pc"] += 1
-            elif ins.op == "param":
-                # Store param value in frame for later use by call
-                if "_params" not in frame:
-                    frame["_params"] = []
-                val = get_val(frame, ins.arg1)
-                frame["_params"].append(val)
+            elif op == "param":
+                frame["_params"].append(get_val(frame, ins.arg1))
                 frame["pc"] += 1
-            elif ins.op == "call":
-                # Use params stored by param instructions
+            elif op == "call":
                 args = frame.get("_params", [])
-                frame["_params"] = []  # Reset for next call
-                # find function
+                frame["_params"] = []
                 callee = prog.functions.get(ins.arg1)
                 if callee is None:
-                    # Handle built-in functions like printf
                     if ins.arg1 == "printf":
-                        # Handle printf: first arg is format string, rest are args
                         fmt = args[0] if args else ""
                         vals = args[1:] if len(args) > 1 else []
-                        # Simple printf handling
                         result.stdout += fmt % tuple(vals) if vals else fmt
                         frame["pc"] += 1
                         continue
-                    else:
-                        result.error = "undefined function"
-                        break
-                # push frame for user functions
-                callee = prog.functions.get(ins.arg1)
-                if callee is not None:
-                    new_frame = make_frame(callee, args)
-                    call_stack.append(new_frame)
-                    frame["_pending_result"] = ins.result
-                    frame["_pending_ty"] = ins.ty or (callee.ret_ty or "i32")
-                    frame["pc"] += 1
-                else:
                     result.error = "undefined function"
                     break
-            elif ins.op == "return":
+                new_frame = make_frame(callee, args)
+                call_stack.append(new_frame)
+                frame["_pending_result"] = ins.result
+                frame["_pending_ty"] = ins.ty or (callee.ret_ty or "i32")
+                frame["pc"] += 1
+            elif op == "return":
                 retval = None
                 if ins.arg1 is not None:
                     retval = get_val(frame, ins.arg1)
@@ -337,12 +393,11 @@ def run_program(prog, inputs=None, max_steps=1_000_000, max_depth=1000):
                     pr = caller.get("_pending_result")
                     if pr:
                         ty = caller.get("_pending_ty", "i32")
-                        from ir.tac import wrap
                         set_val(caller, pr, wrap(retval, ty) if retval is not None else 0)
                         del caller["_pending_result"]
                         del caller["_pending_ty"]
             else:
-                result.error = "unknown op %s" % ins.op
+                result.error = "unknown op %s" % op
                 break
         except RuntimeError as e:
             result.error = str(e)
@@ -357,27 +412,11 @@ def run_program(prog, inputs=None, max_steps=1_000_000, max_depth=1000):
     return result
 
 
-def _wrap_value(val, ty):
-    """Store `val` in a slot of type `ty`, wrapping integers to its width."""
-    if not isinstance(val, int) or isinstance(val, bool):
-        return val
-    kind = getattr(ty, "kind", None)
-    if kind in ("scalar", "pointer"):
-        from ir.tac import wrap
-        return wrap(val, ty)
-    if kind is None and isinstance(ty, str):
-        from ir.tac import wrap
-        return wrap(val, ty)
-    return val
-
-
 def _format_val(v, spec, ty):
     # spec like "d", "u", "c", "x", "02d", etc.
-    # handle width/zero flag
     from ir.tac import _bits_signed
     bits, _signed = _bits_signed(ty)
     zero = spec.startswith("0")
-    # extract width
     width_str = "".join(ch for ch in spec if ch.isdigit())
     width = int(width_str) if width_str else 0
     base_spec = "".join(ch for ch in spec if not ch.isdigit())
@@ -400,11 +439,11 @@ def _format_val(v, spec, ty):
         if width:
             s = s.rjust(width, "0" if zero else " ")
         return s
-    # default signed decimal
     s = str(v)
     if width:
         s = s.rjust(width, "0" if zero else " ")
     return s
+
 
 # legacy wrapper
 def run(tac, inputs=None, max_steps=100000):

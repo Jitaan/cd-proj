@@ -1,4 +1,4 @@
-﻿# frontend/c_parser.py - C parser (C1, scalar + main)
+﻿# frontend/c_parser.py - C parser (C1, scalar + main + arrays/pointers)
 import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
 from c_lexer import lex_c, CToken, CLexError
@@ -30,18 +30,25 @@ class Parser:
         while self.peek().kind != "EOF":
             if self.peek().kind == "KEYWORD" and self.peek().value in ("struct","enum","typedef","switch","goto"):
                 raise CParseError(self.peek().line, self.peek().col, "unsupported feature: %s" % self.peek().value)
-            # function or global
-            decls.append(self.parse_top_level())
+            # function or one or more global variables
+            d = self.parse_top_level()
+            if isinstance(d, list):
+                decls.extend(d)
+            else:
+                decls.append(d)
         return ("TU", decls)
 
     def parse_top_level(self):
         # type + name
         ty = self.parse_type()
-        name_tok = self.expect("IDENT")
-        name_loc = self._loc(name_tok)
-        if self.peek().kind == "OP" and self.peek().value == "(":
+        is_func = (self.peek().kind == "IDENT"
+                   and self.i + 1 < len(self.toks)
+                   and self.toks[self.i + 1].kind == "OP"
+                   and self.toks[self.i + 1].value == "(")
+        if is_func:
+            name_tok = self.advance()
             # function
-            self.advance()
+            self.expect("OP", "(")
             params = []
             if not (self.peek().kind == "OP" and self.peek().value == ")"):
                 params.append(self.parse_param())
@@ -51,16 +58,24 @@ class Parser:
             self.expect("OP", ")")
             if self.peek().kind == "OP" and self.peek().value == ";":
                 self.advance()
-                return ("FuncDecl", ty, name_tok.value, params, name_loc)
+                return ("FuncDecl", ty, name_tok.value, params)
             body = self.parse_block()
-            return ("FuncDef", ty, name_tok.value, params, body, name_loc)
-        # global var
-        init = None
-        if self.peek().kind == "OP" and self.peek().value == "=":
-            self.advance()
-            init = self.parse_expr()
+            return ("FuncDef", ty, name_tok.value, params, body)
+        # global variables, possibly comma separated: int a, b = 2, c;
+        decls = []
+        while True:
+            dty, name, name_loc = self.parse_declarator(ty)
+            init = None
+            if self.peek().kind == "OP" and self.peek().value == "=":
+                self.advance()
+                init = self.parse_expr()
+            decls.append(("GlobalVar", dty, name, init, name_loc))
+            if self.peek().kind == "OP" and self.peek().value == ",":
+                self.advance()
+                continue
+            break
         self.expect("OP", ";")
-        return ("GlobalVar", ty, name_tok.value, init, name_loc)
+        return decls
 
     def parse_type(self):
         specs = []
@@ -70,11 +85,43 @@ class Parser:
             raise CParseError(self.peek().line, self.peek().col, "expected type")
         return ("Type", specs)
 
+    def parse_declarator(self, base_type):
+        """Parse declarator with possible pointer/array modifiers"""
+        # Handle pointer declarators (*)
+        ptr_level = 0
+        while self.peek().kind == "OP" and self.peek().value == "*":
+            self.advance()
+            ptr_level += 1
+
+        # Must have identifier
+        if self.peek().kind != "IDENT":
+            raise CParseError(self.peek().line, self.peek().col, "expected identifier")
+        name = self.advance().value
+        name_loc = self._loc(self.toks[self.i-1])
+
+        # Handle array declarators (e.g., [10])
+        array_size = None
+        if self.peek().kind == "OP" and self.peek().value == "[":
+            self.advance()  # consume [
+            if self.peek().kind == "INT_LIT":
+                array_size = self.advance().value
+            else:
+                # Variable length array - for now just accept empty []
+                pass
+            self.expect("OP", "]")
+
+        # Build the type with pointer/array modifiers
+        ty = base_type
+        if array_size is not None:
+            ty = ("Array", array_size, ty)
+        for _ in range(ptr_level):
+            ty = ("Pointer", ty)
+
+        return (ty, name, name_loc)
+
     def parse_param(self):
         ty = self.parse_type()
-        name = self.expect("IDENT").value
-        name_loc = self._loc(self.toks[self.i-1])
-        return (ty, name, name_loc)
+        return self.parse_declarator(ty)
 
     def parse_block(self):
         self.expect("OP", "{")
@@ -82,7 +129,11 @@ class Parser:
         while not (self.peek().kind == "OP" and self.peek().value == "}"):
             if self.peek().kind == "EOF":
                 raise CParseError(self.peek().line, self.peek().col, "expected }")
-            stmts.append(self.parse_stmt_or_decl())
+            st = self.parse_stmt_or_decl()
+            if isinstance(st, list):
+                stmts.extend(st)
+            else:
+                stmts.append(st)
         self.expect("OP", "}")
         return ("Block", stmts)
 
@@ -92,17 +143,28 @@ class Parser:
             return self.parse_decl()
         return self.parse_stmt()
 
-    def parse_decl(self):
-        ty = self.parse_type()
-        name = self.expect("IDENT").value
-        name_loc = self._loc(self.toks[self.i-1])
-        init = None
-        if self.peek().kind == "OP" and self.peek().value == "=":
-            self.advance()
-            init = self.parse_expr()
-        # multiple declarators not supported
-        self.expect("OP", ";")
-        return ("VarDecl", ty, name, init, name_loc)
+    def parse_decl(self, consume_semicolon=True):
+        """Parse a declaration with one or more comma-separated declarators.
+
+        Returns a list of ("VarDecl", ty, name, init, loc) nodes; callers that
+        place declarations in a statement list should splice the list.
+        """
+        base_ty = self.parse_type()
+        decls = []
+        while True:
+            ty, name, name_loc = self.parse_declarator(base_ty)
+            init = None
+            if self.peek().kind == "OP" and self.peek().value == "=":
+                self.advance()
+                init = self.parse_expr()
+            decls.append(("VarDecl", ty, name, init, name_loc))
+            if self.peek().kind == "OP" and self.peek().value == ",":
+                self.advance()
+                continue
+            break
+        if consume_semicolon:
+            self.expect("OP", ";")
+        return decls
 
     def parse_stmt(self):
         t = self.peek()
@@ -140,21 +202,44 @@ class Parser:
             self.advance()
             self.expect("OP", "(")
             init = None
+            # parse init
             if not (self.peek().kind == "OP" and self.peek().value == ";"):
                 if self.peek().kind == "KEYWORD" and self.peek().value in ("const","char","short","int","long","unsigned","signed","void"):
-                    init = self.parse_decl()
+                    decls = self.parse_decl(consume_semicolon=False)
+                    init = decls[0] if len(decls) == 1 else ("VarDecls", decls)
                 else:
                     init = self.parse_simple_stmt()
-                    self.expect("OP", ";")
+                self.expect("OP", ";")
             else:
                 self.expect("OP", ";")
+            # parse condition
             cond = None
             if not (self.peek().kind == "OP" and self.peek().value == ";"):
+                # Find the semicolon that ends the condition (at paren depth 0)
+                cond_end = self.i
+                paren_depth = 0
+                while cond_end < len(self.toks):
+                    tok = self.toks[cond_end]
+                    if tok.kind == "OP" and tok.value == "(":
+                        paren_depth += 1
+                    elif tok.kind == "OP" and tok.value == ")":
+                        paren_depth -= 1
+                    elif tok.kind == "OP" and tok.value == ";" and paren_depth == 0:
+                        break
+                    cond_end += 1
+                # Parse condition from current position to cond_end (exclusive)
+                saved_toks = self.toks
+                self.toks = self.toks[:cond_end]
                 cond = self.parse_expr()
+                self.toks = saved_toks
+                self.i = cond_end  # Position at the semicolon
+            else:
+                cond = None
             self.expect("OP", ";")
+            # parse step
             step = None
             if not (self.peek().kind == "OP" and self.peek().value == ")"):
-                step = self.parse_simple_stmt()
+                step = self.parse_expr()
             self.expect("OP", ")")
             body = self.parse_stmt()
             return ("For", init, cond, step, body, stmt_loc)
@@ -186,6 +271,19 @@ class Parser:
 
     def parse_simple_stmt(self):
         # assignment or inc/dec (no trailing ;)
+        # Parse a general lvalue expression followed by assignment operator
+        if self.peek().kind == "OP" and self.peek().value in ("*", "&"):
+            # Pointer dereference or address-of as lvalue
+            op = self.advance().value
+            expr = self.parse_simple_stmt()  # recursive for *p++ etc
+            if self.peek().kind == "OP" and self.peek().value in ("=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="):
+                op = self.advance().value
+                e = self.parse_expr()
+                return ("UnaryAssign", op, expr, op, e)
+            if self.peek().kind == "OP" and self.peek().value in ("++", "--"):
+                op = self.advance().value
+                return ("UnaryIncDec", op, False, expr)
+            raise CParseError(self.peek().line, self.peek().col, "expected assignment after unary")
         if self.peek().kind != "IDENT":
             raise CParseError(self.peek().line, self.peek().col, "expected identifier")
         name = self.advance().value
@@ -197,6 +295,16 @@ class Parser:
         if self.peek().kind == "OP" and self.peek().value in ("++", "--"):
             op = self.advance().value
             return ("IncDec", op, False, name, name_loc)
+        # Check for array subscript or member access on the identifier
+        if self.peek().kind == "OP" and self.peek().value in ("[", "->", "."):
+            # This is a complex lvalue, parse as expression and check for assignment
+            # Re-parse as expression and check for assignment
+            self.i -= 1  # backtrack to re-parse as expression
+            expr = self.parse_expr()
+            if self.peek().kind == "OP" and self.peek().value in ("=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="):
+                op = self.advance().value
+                e = self.parse_expr()
+                return ("Assign", op, expr, e)
         raise CParseError(self.peek().line, self.peek().col, "expected assignment")
 
     def parse_io_stmt(self):
@@ -232,90 +340,99 @@ class Parser:
             return ("Putchar", e, kw_loc)
 
     # expressions with precedence climbing
-    def parse_expr(self):
-        return self.parse_ternary()
+    def parse_expr(self, stop_tokens=None):
+        return self.parse_assignment(stop_tokens)
 
-    def parse_ternary(self):
-        cond = self.parse_logical_or()
+    def parse_assignment(self, stop_tokens=None):
+        # Assignment has the lowest precedence (right-associative)
+        left = self.parse_ternary(stop_tokens)
+        if self.peek().kind == "OP" and self.peek().value in ("=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="):
+            op = self.advance().value
+            right = self.parse_assignment(stop_tokens)
+            return ("Assign", op, left, right)
+        return left
+
+    def parse_ternary(self, stop_tokens=None):
+        cond = self.parse_logical_or(stop_tokens)
         if self.peek().kind == "OP" and self.peek().value == "?":
             self.advance()
-            t = self.parse_expr()
+            t = self.parse_expr(stop_tokens)
             self.expect("OP", ":")
-            f = self.parse_ternary()
+            f = self.parse_ternary(stop_tokens)
             return ("Ternary", cond, t, f)
         return cond
 
-    def parse_logical_or(self):
-        node = self.parse_logical_and()
+    def parse_logical_or(self, stop_tokens=None):
+        node = self.parse_logical_and(stop_tokens)
         while self.peek().kind == "OP" and self.peek().value == "||":
             self.advance()
-            node = ("BinOp", "||", node, self.parse_logical_and())
+            node = ("BinOp", "||", node, self.parse_logical_and(stop_tokens))
         return node
 
-    def parse_logical_and(self):
-        node = self.parse_bitwise_or()
+    def parse_logical_and(self, stop_tokens=None):
+        node = self.parse_bitwise_or(stop_tokens)
         while self.peek().kind == "OP" and self.peek().value == "&&":
             self.advance()
-            node = ("BinOp", "&&", node, self.parse_bitwise_or())
+            node = ("BinOp", "&&", node, self.parse_bitwise_or(stop_tokens))
         return node
 
-    def parse_bitwise_or(self):
-        node = self.parse_bitwise_xor()
+    def parse_bitwise_or(self, stop_tokens=None):
+        node = self.parse_bitwise_xor(stop_tokens)
         while self.peek().kind == "OP" and self.peek().value == "|":
             self.advance()
-            node = ("BinOp", "|", node, self.parse_bitwise_xor())
+            node = ("BinOp", "|", node, self.parse_bitwise_xor(stop_tokens))
         return node
 
-    def parse_bitwise_xor(self):
-        node = self.parse_bitwise_and()
+    def parse_bitwise_xor(self, stop_tokens=None):
+        node = self.parse_bitwise_and(stop_tokens)
         while self.peek().kind == "OP" and self.peek().value == "^":
             self.advance()
-            node = ("BinOp", "^", node, self.parse_bitwise_and())
+            node = ("BinOp", "^", node, self.parse_bitwise_and(stop_tokens))
         return node
 
-    def parse_bitwise_and(self):
-        node = self.parse_equality()
+    def parse_bitwise_and(self, stop_tokens=None):
+        node = self.parse_equality(stop_tokens)
         while self.peek().kind == "OP" and self.peek().value == "&":
             self.advance()
-            node = ("BinOp", "&", node, self.parse_equality())
+            node = ("BinOp", "&", node, self.parse_equality(stop_tokens))
         return node
 
-    def parse_equality(self):
-        node = self.parse_relational()
+    def parse_equality(self, stop_tokens=None):
+        node = self.parse_relational(stop_tokens)
         while self.peek().kind == "OP" and self.peek().value in ("==", "!="):
             op = self.advance().value
-            node = ("BinOp", op, node, self.parse_relational())
+            node = ("BinOp", op, node, self.parse_relational(stop_tokens))
         return node
 
-    def parse_relational(self):
-        node = self.parse_shift()
+    def parse_relational(self, stop_tokens=None):
+        node = self.parse_shift(stop_tokens)
         while self.peek().kind == "OP" and self.peek().value in ("<", ">", "<=", ">="):
             op = self.advance().value
-            node = ("BinOp", op, node, self.parse_shift())
+            node = ("BinOp", op, node, self.parse_shift(stop_tokens))
         return node
 
-    def parse_shift(self):
-        node = self.parse_additive()
+    def parse_shift(self, stop_tokens=None):
+        node = self.parse_additive(stop_tokens)
         while self.peek().kind == "OP" and self.peek().value in ("<<", ">>"):
             op = self.advance().value
-            node = ("BinOp", op, node, self.parse_additive())
+            node = ("BinOp", op, node, self.parse_additive(stop_tokens))
         return node
 
-    def parse_additive(self):
-        node = self.parse_multiplicative()
+    def parse_additive(self, stop_tokens=None):
+        node = self.parse_multiplicative(stop_tokens)
         while self.peek().kind == "OP" and self.peek().value in ("+", "-"):
             op = self.advance().value
-            node = ("BinOp", op, node, self.parse_multiplicative())
+            node = ("BinOp", op, node, self.parse_multiplicative(stop_tokens))
         return node
 
-    def parse_multiplicative(self):
-        node = self.parse_cast()
+    def parse_multiplicative(self, stop_tokens=None):
+        node = self.parse_cast(stop_tokens)
         while self.peek().kind == "OP" and self.peek().value in ("*", "/", "%"):
             op = self.advance().value
-            node = ("BinOp", op, node, self.parse_cast())
+            node = ("BinOp", op, node, self.parse_cast(stop_tokens))
         return node
 
-    def parse_cast(self):
+    def parse_cast(self, stop_tokens=None):
         if self.peek().kind == "OP" and self.peek().value == "(":
             # could be cast or parenthesized expr
             saved = self.i
@@ -323,41 +440,74 @@ class Parser:
             if self.peek().kind == "KEYWORD" and self.peek().value in ("char","short","int","long","unsigned","signed","void","const"):
                 ty = self.parse_type()
                 self.expect("OP", ")")
-                e = self.parse_cast()
+                e = self.parse_cast(stop_tokens)
                 return ("Cast", ty, e)
             self.i = saved
-        return self.parse_unary()
+        return self.parse_unary_expr(stop_tokens)
 
-    def parse_unary(self):
-        t = self.peek()
-        if t.kind == "OP" and t.value in ("-", "!", "~", "++", "--"):
+    def parse_unary_expr(self, stop_tokens=None):
+        # Unary expressions: postfix expressions and unary operators
+        # Postfix has higher precedence than unary operators
+        if self.peek().kind == "OP" and self.peek().value in ("-", "!", "~", "++", "--", "*", "&"):
             op = self.advance().value
             if op in ("++", "--"):
-                if self.peek().kind != "IDENT":
-                    raise CParseError(t.line, t.col, "expected identifier")
-                name = self.advance().value
-                name_loc = self._loc(self.toks[self.i-1])
-                return ("IncDec", op, True, name, name_loc)
-            e = self.parse_cast()
+                e = self.parse_unary_expr(stop_tokens)
+                return ("IncDec", op, True, e)
+            e = self.parse_cast(stop_tokens)
+            if op == "-":
+                return ("Unary", "-", e)
+            elif op == "!":
+                return ("Unary", "!", e)
+            elif op == "~":
+                return ("Unary", "~", e)
+            elif op == "*":
+                return ("Unary", "*", e)  # dereference
+            elif op == "&":
+                return ("Unary", "&", e)  # address-of
             return ("Unary", op, e)
-        if t.kind == "KEYWORD" and t.value in ("sizeof",):
-            raise CParseError(t.line, t.col, "unsupported: sizeof")
-        return self.parse_postfix()
+        else:
+            return self.parse_postfix_expr(stop_tokens)
 
-    def parse_postfix(self):
-        node = self.parse_primary()
+    def parse_postfix_expr(self, stop_tokens=None):
+        # Postfix expressions: primary followed by [], (), ., ->, ++, --
+        node = self.parse_primary(stop_tokens)
         while True:
-            if self.peek().kind == "OP" and self.peek().value == "++":
+            if self.peek().kind == "OP" and self.peek().value == "[":
+                # Array subscript: base[index]
+                self.advance()  # consume [
+                idx = self.parse_expr(stop_tokens)
+                self.expect("OP", "]")
+                node = ("Index", node, idx)
+            elif self.peek().kind == "OP" and self.peek().value == "(":
+                # Function call: func(args)
+                self.advance()  # consume (
+                args = []
+                if not (self.peek().kind == "OP" and self.peek().value == ")"):
+                    args.append(self.parse_expr(stop_tokens))
+                    while self.peek().kind == "OP" and self.peek().value == ",":
+                        self.advance()
+                        args.append(self.parse_expr(stop_tokens))
+                self.expect("OP", ")")
+                node = ("Call", node[1] if node[0] == "Ident" else node, args)
+            elif self.peek().kind == "OP" and self.peek().value == ".":
+                # Member access: obj.member
+                self.advance()  # consume .
+                member = self.expect("IDENT").value
+                node = ("Member", node, member)
+            elif self.peek().kind == "OP" and self.peek().value == "->":
+                # Pointer member access: ptr->member
                 self.advance()
-                node = ("IncDec", "++", False, node)
-            elif self.peek().kind == "OP" and self.peek().value == "--":
-                self.advance()
-                node = ("IncDec", "--", False, node)
+                member = self.expect("IDENT").value
+                node = ("Arrow", node, member)
+            elif self.peek().kind == "OP" and self.peek().value in ("++", "--"):
+                # Postfix increment/decrement: i++, i--
+                op = self.advance().value
+                node = ("IncDec", op, False, node)
             else:
                 break
         return node
 
-    def parse_primary(self):
+    def parse_primary(self, stop_tokens=None):
         t = self.peek()
         if t.kind == "INT_LIT":
             self.advance()
@@ -369,13 +519,14 @@ class Parser:
             name = self.advance().value
             name_loc = self._loc(self.toks[self.i-1])
             if self.peek().kind == "OP" and self.peek().value == "(":
+                # Function call
                 self.advance()
                 args = []
                 if not (self.peek().kind == "OP" and self.peek().value == ")"):
-                    args.append(self.parse_expr())
+                    args.append(self.parse_expr(stop_tokens))
                     while self.peek().kind == "OP" and self.peek().value == ",":
                         self.advance()
-                        args.append(self.parse_expr())
+                        args.append(self.parse_expr(stop_tokens))
                 self.expect("OP", ")")
                 return ("Call", name, args, name_loc)
             return ("Ident", name, name_loc)
@@ -384,10 +535,16 @@ class Parser:
             return ("StringLit", t.value)
         if t.kind == "OP" and t.value == "(":
             self.advance()
-            e = self.parse_expr()
+            e = self.parse_expr(stop_tokens)
             self.expect("OP", ")")
             return e
+        # Check for statement terminators
+        if t.kind == "OP" and t.value in (";", ")", ",", "}"):
+            if stop_tokens and t.kind in stop_tokens and t.value in stop_tokens[t.kind]:
+                return ("EndOfExpr",)
+            raise CParseError(t.line, t.col, "unexpected token %r" % (t.value,))
         raise CParseError(t.line, t.col, "unexpected token %r" % (t.value,))
+
 
 def parse_c(src):
     import sys, os

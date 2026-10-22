@@ -1,4 +1,4 @@
-﻿# frontend/c_types.py - C type system (C1)
+﻿# frontend/c_types.py - C type system (C1 + arrays/pointers)
 
 class CType:
     def __init__(self, bits, signed, void=False):
@@ -53,9 +53,23 @@ def parse_type_specifiers(specs):
     return _parse_one(specs)
 
 def common_type(a, b):
-    # usual arithmetic conversions, simplified
-    # promote to at least int (32-bit)
+    # Handle array/pointer types first
+    from frontend.c_types import is_array_type, is_pointer_type
+    
+    # If either is array, it decays to pointer in most contexts
+    if is_array_type(a) or is_array_type(b):
+        # Array decays to pointer, treat as pointer arithmetic
+        return a if is_pointer_type(a) else b
+    
+    # If either is pointer, return pointer type
+    if is_pointer_type(a) or is_pointer_type(b):
+        return a if is_pointer_type(a) else b
+    
+    # Both should be CType objects for usual arithmetic conversions
     def promote(t):
+        if isinstance(t, tuple):
+            # Should not happen for non-array/pointer types
+            return CType(32, True)
         if t.bits < 32:
             return CType(32, t.signed)
         return t
@@ -74,3 +88,33 @@ def common_type(a, b):
     if not a.signed or not b.signed:
         return CType(32, False)
     return CType(32, True)
+
+# Array and pointer type helpers
+def is_array_type(ty):
+    return isinstance(ty, tuple) and ty[0] == "Array"
+
+def is_pointer_type(ty):
+    return isinstance(ty, tuple) and ty[0] == "Pointer"
+
+def get_array_info(ty):
+    """Returns (size, element_type) for array type"""
+    if is_array_type(ty):
+        return ty[1], ty[2]
+    return None, None
+
+def get_pointer_base(ty):
+    """Returns base type for pointer type"""
+    if is_pointer_type(ty):
+        return ty[1]
+    return None
+
+def type_to_tag(ty):
+    """Convert type to tag string for TAC"""
+    if isinstance(ty, CType):
+        return ty.tag
+    if isinstance(ty, tuple):
+        if ty[0] == "Array":
+            return "array%d" % ty[1]
+        if ty[0] == "Pointer":
+            return "ptr"
+    return "i32"

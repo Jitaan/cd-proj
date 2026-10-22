@@ -106,15 +106,30 @@ def uses(instr):
         s = set()
         if isinstance(instr.arg1, str): s.add(instr.arg1)
         return s
-    if op == "print":
+    if op == "if":
+        s = set()
+        if isinstance(instr.arg1, str): s.add(instr.arg1)
+        if isinstance(instr.arg2, str): s.add(instr.arg2)
+        return s
+    if op == "load":
+        s = set()
+        if isinstance(instr.arg1, str): s.add(instr.arg1)
+        if isinstance(instr.arg2, str): s.add(instr.arg2)
+        return s
+    if op == "store":
+        s = set()
+        for v in (instr.arg1, instr.arg2, instr.result):
+            if isinstance(v, str): s.add(v)
+        return s
+    if op == "addr":
+        s = set()
+        if isinstance(instr.arg1, str): s.add(instr.arg1)
+        return s
+    if op in ("print", "out_val"):
         s = set()
         if isinstance(instr.arg1, str): s.add(instr.arg1)
         return s
     if op == "out_str": return set()
-    if op == "out_val":
-        s = set()
-        if isinstance(instr.arg1, str): s.add(instr.arg1)
-        return s
     if op == "read":
         return set()
     if op == "return":
@@ -126,7 +141,11 @@ def uses(instr):
         for x in (instr.args or ()):
             if isinstance(x, str): s.add(x)
         return s
-    if op == "cast":
+    if op == "param":
+        s = set()
+        if isinstance(instr.arg1, str): s.add(instr.arg1)
+        return s
+    if op in ("cast", "bnot"):
         s = set()
         if isinstance(instr.arg1, str): s.add(instr.arg1)
         return s
@@ -148,13 +167,13 @@ def uses(instr):
 def defs(instr):
     op = instr.op
     if op in ("label", "goto", "ifFalse", "print", "out_str", "out_val",
-              "read", "return"):
+              "read", "return", "store", "param"):
         return None
     return instr.result
 
 def has_side_effect(instr):
     if instr.op in ("print", "out_str", "out_val", "read", "goto", "ifFalse",
-                     "label", "return", "call"):
+                     "label", "return", "call", "store"):
         return True
     if instr.op in ("/", "%", "<<", ">>"):
         return True
@@ -177,6 +196,9 @@ def instr_str(i):
             return "%s = call %s(%s)" % (i.result, i.arg1, args)
         return "call %s(%s)" % (i.arg1, args)
     if op == "cast": return "%s = (%s) %s" % (i.result, i.ty, i.arg1)
+    if op == "load": return "%s = %s[%s]" % (i.result, i.arg1, i.arg2)
+    if op == "store": return "%s[%s] = %s" % (i.arg1, i.arg2, i.result)
+    if op == "addr": return "%s = &%s" % (i.result, i.arg1)
     if op in ("neg", "not", "bnot"):
         return "%s = %s %s" % (i.result, op, i.arg1)
     if op == "copy": return "%s = %s" % (i.result, i.arg1)

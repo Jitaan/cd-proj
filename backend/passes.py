@@ -407,7 +407,7 @@ def _dce(instrs, ctx=None):
                 dst = tac.defs(ins)
                 # Keep instructions with side effects
                 if ins.op in ("call", "return", "out_str", "out_val", "read",
-                              "goto", "ifFalse", "if", "label", "/", "%"):
+                              "goto", "ifFalse", "if", "label", "/", "%", "store"):
                     if ins.op == "call" and dst is not None and dst not in live:
                         ins = ins._replace(result=None)
                         changed = True

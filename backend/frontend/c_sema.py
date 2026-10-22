@@ -1,7 +1,7 @@
-﻿# frontend/c_sema.py - semantic analysis (C1, scalar + main)
+﻿# frontend/c_sema.py - semantic analysis (C1, scalar + main + arrays/pointers)
 import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
-from c_types import parse_type_specifiers, common_type, CType, VOID
+from c_types import parse_type_specifiers, common_type, CType, VOID, is_array_type, is_pointer_type, get_array_info, get_pointer_base, type_to_tag
 
 class SemanticError(Exception):
     def __init__(self, line, col, msg):
@@ -21,6 +21,14 @@ def _get_loc(node):
         if isinstance(last, tuple) and len(last) == 2 and all(isinstance(x, int) for x in last):
             return last
     return (0, 0)
+
+def _strip_loc(node):
+    """Remove a trailing (line, col) tuple from a node, if present."""
+    if isinstance(node, tuple) and len(node) > 0:
+        last = node[-1]
+        if isinstance(last, tuple) and len(last) == 2 and all(isinstance(x, int) for x in last):
+            return node[:-1]
+    return node
 
 class Sema:
     def __init__(self):
@@ -84,12 +92,45 @@ class Sema:
             return ("Cast", ty, e), ty
         if kind == "Unary":
             e, et = self.annotate_expr(node[2])
-            if node[1] == "!":
-                return ("Unary", node[1], e), CType(32, True)
-            return ("Unary", node[1], e), et
+            op = node[1]
+            if op == "!":
+                return ("Unary", op, e), CType(32, True)
+            if op == "*":
+                # dereference
+                if is_pointer_type(et):
+                    base_ty = get_pointer_base(et)
+                    return ("Unary", op, e), base_ty
+                raise SemanticError(loc[0], loc[1], "dereference of non-pointer")
+            if op == "&":
+                # address-of
+                if is_array_type(et):
+                    # array decays to pointer
+                    base_ty = get_array_info(et)[1]
+                    return ("Unary", op, e), ("Pointer", base_ty)
+                if isinstance(et, CType):
+                    return ("Unary", op, e), ("Pointer", et)
+                raise SemanticError(loc[0], loc[1], "address-of non-lvalue")
+            return ("Unary", op, e), et
         if kind == "IncDec":
-            # prefix/postfix
-            return node, CType(32, True)
+            # prefix/postfix: resolve the lvalue name in the current scope
+            base = node[3]
+            if isinstance(base, str):
+                uniq, ty = self.lookup(base, loc[0], loc[1])
+                return ("IncDec", node[1], node[2], uniq), ty
+            b, bt = self.annotate_expr(_strip_loc(base))
+            return ("IncDec", node[1], node[2], b), bt
+        if kind == "Assign":
+            op = node[1]
+            lhs = node[2]
+            if isinstance(lhs, str):
+                uniq, lty = self.lookup(lhs, loc[0], loc[1])
+                lhs = uniq
+            elif isinstance(lhs, tuple):
+                lhs, lty = self.annotate_expr(_strip_loc(lhs))
+            else:
+                lty = CType(32, True)
+            rhs, rty = self.annotate_expr(node[3])
+            return ("Assign", op, lhs, rhs), (rty or lty or CType(32, True))
         if kind == "BinOp":
             l, lt = self.annotate_expr(node[2])
             r, rt = self.annotate_expr(node[3])
@@ -123,12 +164,37 @@ class Sema:
                 args.append(an)
                 argtypes.append(at)
             return ("Call", name, args), CType(32, True)
+        if kind == "Index":
+            # array subscript: base[index]
+            base, bt = self.annotate_expr(node[1])
+            idx, it = self.annotate_expr(node[2])
+            if is_array_type(bt):
+                elem_ty = get_array_info(bt)[1]
+                return ("Index", base, idx), elem_ty
+            if is_pointer_type(bt):
+                # pointer arithmetic
+                base_ty = get_pointer_base(bt)
+                return ("Index", base, idx), base_ty
+            raise SemanticError(loc[0], loc[1], "subscripted value is not an array or pointer")
+        if kind == "Arrow":
+            # ptr->member
+            base, bt = self.annotate_expr(node[1])
+            member = node[2]
+            # For now, just treat as base type
+            if is_pointer_type(bt):
+                base_ty = get_pointer_base(bt)
+                return ("Arrow", base, member), base_ty
+            raise SemanticError(loc[0], loc[1], "arrow on non-pointer")
         return node, CType(32, True)
 
     def analyze_decl(self, node, is_global=False):
         loc = _get_loc(node)
-        ty_specs = node[1][1] if isinstance(node[1], tuple) else node[1]
-        ty = parse_type_specifiers(ty_specs)
+        # node[1] is the type from parser, which can be:
+        # - ("Type", specs) for basic types
+        # - ("Array", size, base_type) for arrays
+        # - ("Pointer", base_type) for pointers
+        # We use it directly as the type
+        ty = node[1]
         name = node[2]
         uniq = self.declare(name, ty, loc[0], loc[1], is_global=is_global)
         init = node[3]
@@ -172,13 +238,18 @@ class Sema:
             if node[1] is not None:
                 if node[1][0] == "VarDecl":
                     init = self.analyze_decl(node[1])
+                elif node[1][0] == "VarDecls":
+                    # for (int i = 0, j = 0; ...)
+                    init = ("VarDecls", [self.analyze_decl(d) for d in node[1][1]])
                 else:
-                    # simple stmt expr
-                    init = node[1]
+                    # simple stmt expr (assignment / inc-dec) in the for-init
+                    init, _ = self.annotate_expr(_strip_loc(node[1]))
             cond = None
             if node[2] is not None:
                 cond, _ = self.annotate_expr(node[2])
             step = node[3]
+            if step is not None:
+                step, _ = self.annotate_expr(_strip_loc(step))
             self.loop_depth += 1
             body = self.analyze_stmt(node[4])
             self.loop_depth -= 1

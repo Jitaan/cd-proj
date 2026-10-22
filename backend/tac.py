@@ -13,27 +13,39 @@ class Instr(namedtuple("Instr", "op arg1 arg2 result ty args op_relop", defaults
     def dst(self): return self.result
 
 BINARY_OPS = {"+","-","*","/","%","<",">","<=",">=","==","!=","&&","||","&","|","^","<<",">>","shl","if"}
-UNARY_OPS = {"neg","not"}
+UNARY_OPS = {"neg","not","bnot"}
 def is_const(x): return isinstance(x,int) and not isinstance(x,bool)
 def is_var(x): return isinstance(x,str)
 def is_temp(x): return isinstance(x,str) and __import__("re").fullmatch(r"t\d+",x) is not None
 def uses(instr):
     op=instr.op
     if op in ("label","goto"): return set()
-    if op=="ifFalse":
+    if op in ("ifFalse","if"):
         s=set()
-        if isinstance(instr.a,str): s.add(instr.a)
+        if isinstance(instr.arg1,str): s.add(instr.arg1)
+        if op == "if" and isinstance(instr.arg2,str): s.add(instr.arg2)
         return s
-    if op=="if":
+    if op == "load":
+        # load base[index] -> result
         s=set()
         if isinstance(instr.arg1,str): s.add(instr.arg1)
         if isinstance(instr.arg2,str): s.add(instr.arg2)
+        return s
+    if op == "store":
+        # store base[index] = value (value travels in `result`)
+        s=set()
+        for v in (instr.arg1, instr.arg2, instr.result):
+            if isinstance(v,str): s.add(v)
+        return s
+    if op == "addr":
+        s=set()
+        if isinstance(instr.arg1,str): s.add(instr.arg1)
         return s
     if op in ("print","out_val"):
         s=set()
         if isinstance(instr.a,str): s.add(instr.a)
         return s
-    if op in ("copy","neg","not"):
+    if op in ("copy","neg","not","bnot","cast"):
         s=set()
         if isinstance(instr.a,str): s.add(instr.a)
         return s
@@ -42,7 +54,11 @@ def uses(instr):
         if isinstance(instr.a,str): s.add(instr.a)
         if isinstance(instr.b,str): s.add(instr.b)
         return s
-    if op in ("out_str","return"):
+    if op == "return":
+        s=set()
+        if isinstance(instr.arg1,str): s.add(instr.arg1)
+        return s
+    if op == "out_str":
         return set()
     if op == "param":
         s=set()
@@ -52,16 +68,14 @@ def uses(instr):
         # call uses the params stored by param instructions
         # but those are separate instructions, so call itself doesn't use vars directly
         return set()
-    if op == "cast":
-        s=set()
-        if isinstance(instr.a,str): s.add(instr.a)
-        return s
     return set()
 def defs(instr):
-    if instr.op in ("label","goto","ifFalse","if","print","out_val","out_str"): return None
+    # `store` writes memory; its `result` field holds the stored value, not a def.
+    if instr.op in ("label","goto","ifFalse","if","print","out_val","out_str",
+                    "param","return","store"): return None
     return instr.dst
 def has_side_effect(instr):
-    if instr.op in ("print","out_val","out_str","goto","ifFalse","if","label"): return True
+    if instr.op in ("print","out_val","out_str","goto","ifFalse","if","label","store","call"): return True
     if instr.op in ("/","%"): return True
     return False
 def eval_op(op,a,b):
@@ -106,6 +120,7 @@ def eval_unary(op,a,ty="i32"):
     if op=="!": return 0 if a!=0 else 1
     if op=="neg": return -a
     if op=="not": return 0 if a!=0 else 1
+    if op=="bnot": return wrap32(~a)
     raise ValueError("unknown unary %s"%op)
 def wrap32(x):
     x=x%(1<<32)
@@ -138,7 +153,10 @@ def instr_str(i):
             return "return %s"%i.arg1
         else:
             return "return"
-    if op in ("neg","not"): return "%s = %s %s"%(i.result,op,i.arg1)
+    if op=="load": return "%s = %s[%s]"%(i.result,i.arg1,i.arg2)
+    if op=="store": return "%s[%s] = %s"%(i.arg1,i.arg2,i.result)
+    if op=="addr": return "%s = &%s"%(i.result,i.arg1)
+    if op in ("neg","not","bnot"): return "%s = %s %s"%(i.result,op,i.arg1)
     if op=="copy": return "%s = %s"%(i.result,i.arg1)
     if op in BINARY_OPS: return "%s = %s %s %s"%(i.result,i.arg1,op,i.arg2)
     return repr(i)

@@ -5,6 +5,17 @@
 import tac
 
 
+# `ifFalse t` jumps on a false comparison, so the relation must be negated.
+_NEGATED_RELOP = {
+    "<": ">=",
+    ">": "<=",
+    "<=": ">",
+    ">=": "<",
+    "==": "!=",
+    "!=": "==",
+}
+
+
 def _cond_jump(instrs):
     """Convert ifFalse of comparison results to proper conditional jumps"""
     out = []
@@ -33,8 +44,12 @@ def _cond_jump(instrs):
                     prev = instrs[j]
                     if prev.result == cond_var:
                         if prev.op in ("<", ">", "<=", ">=", "==", "!="):
-                            # Found the comparison! Convert to proper conditional jump
-                            new_ins = tac.Instr("if", prev.arg1, prev.op, prev.arg2, target)
+                            # Found the comparison. `ifFalse` branches when it is
+                            # false, so emit the inverted relation:
+                            #   t = (a < b); ifFalse t goto L  ->  if a >= b goto L
+                            new_ins = tac.Instr(
+                                "if", prev.arg1, prev.arg2, target,
+                                ty=prev.ty, op_relop=_NEGATED_RELOP[prev.op])
                             out.append(new_ins)
                             changes += 1
                             break

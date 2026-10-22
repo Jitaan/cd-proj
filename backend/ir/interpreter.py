@@ -1,5 +1,6 @@
 ﻿# ir/interpreter.py - multi-function interpreter (C1+C2)
 
+import re
 from dataclasses import dataclass
 
 @dataclass
@@ -43,7 +44,12 @@ def run_program(prog, inputs=None, max_steps=1_000_000, max_depth=1000):
             locals_[pname] = (pty, aval)
         for v, ty in fn.var_types.items():
             if v not in locals_:
-                locals_[v] = (ty, None)  # uninitialized
+                # Check if it's an array type (e.g., "array10")
+                if isinstance(ty, str) and ty.startswith("array"):
+                    size = int(ty[5:])  # extract size from "arrayN"
+                    locals_[v] = (ty, [0] * size)
+                else:
+                    locals_[v] = (ty, None)  # uninitialized
         return {"fn": fn, "pc": 0, "locals": locals_, "ret": None}
 
     # initialize globals as defined
@@ -56,13 +62,7 @@ def run_program(prog, inputs=None, max_steps=1_000_000, max_depth=1000):
         if isinstance(operand, int):
             return operand
         if isinstance(operand, str):
-            # Check if it's a string literal (contains chars not valid in C identifiers)
-            # C identifiers: start with letter/underscore, then letters/digits/underscores
-            import re
-            if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', operand):
-                # It's a literal (format string, etc.)
-                return operand
-            # check locals
+            # check locals first: names may contain dots (scope-unique names)
             if operand in frame["locals"]:
                 ty, val = frame["locals"][operand]
                 if val is None:
@@ -71,7 +71,11 @@ def run_program(prog, inputs=None, max_steps=1_000_000, max_depth=1000):
             # globals
             if operand in gvals:
                 return gvals[operand]
-            raise RuntimeError("undefined_var")
+            # Identifiers that are not declared are errors; anything else
+            # (e.g. a printf format string) is a literal.
+            if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', operand):
+                raise RuntimeError("undefined_var")
+            return operand
         return operand
 
     def set_val(frame, name, val, ty=None):
@@ -82,6 +86,27 @@ def run_program(prog, inputs=None, max_steps=1_000_000, max_depth=1000):
             gvals[name] = wrap(val, gtypes[name])
         else:
             frame["locals"][name] = (ty or "i32", val)
+
+    def array_ref(frame, base):
+        """Resolve `base` to (type, list) for array accesses. No hardcoded size."""
+        if not isinstance(base, str):
+            raise RuntimeError("invalid array base")
+        if base in frame["locals"]:
+            ty, val = frame["locals"][base]
+        elif base in gvals:
+            ty, val = gtypes[base], gvals[base]
+        else:
+            raise RuntimeError("unknown array '%s'" % base)
+        if not (isinstance(ty, str) and ty.startswith("array")) or not isinstance(val, list):
+            raise RuntimeError("'%s' is not an array" % base)
+        return ty, val
+
+    def check_index(ty, arr, index):
+        if not isinstance(index, int):
+            raise RuntimeError("non-integer array index")
+        if index < 0 or index >= len(arr):
+            raise RuntimeError("array index %d out of bounds for %s" % (index, ty))
+        return index
 
     steps = 0
     while call_stack:
@@ -143,6 +168,22 @@ def run_program(prog, inputs=None, max_steps=1_000_000, max_depth=1000):
                 v = get_val(frame, ins.arg1)
                 from ir.tac import wrap
                 set_val(frame, ins.result, wrap(v, ins.ty or "i32"))
+                frame["pc"] += 1
+            elif ins.op == "store":
+                # store base, index, value (value travels in `result`)
+                base_name = ins.arg1
+                index = get_val(frame, ins.arg2)
+                value = get_val(frame, ins.result)
+                arr_ty, arr_val = array_ref(frame, base_name)
+                arr_val[check_index(arr_ty, arr_val, index)] = value
+                frame["pc"] += 1
+            elif ins.op == "load":
+                # load base[index] -> result
+                base_name = ins.arg1
+                index = get_val(frame, ins.arg2)
+                arr_ty, arr_val = array_ref(frame, base_name)
+                value = arr_val[check_index(arr_ty, arr_val, index)]
+                set_val(frame, ins.result, value)
                 frame["pc"] += 1
             elif ins.op == "goto":
                 # find label in current function body
@@ -224,7 +265,8 @@ def run_program(prog, inputs=None, max_steps=1_000_000, max_depth=1000):
                 # Store param value in frame for later use by call
                 if "_params" not in frame:
                     frame["_params"] = []
-                frame["_params"].append(get_val(frame, ins.arg1))
+                val = get_val(frame, ins.arg1)
+                frame["_params"].append(val)
                 frame["pc"] += 1
             elif ins.op == "call":
                 # Use params stored by param instructions

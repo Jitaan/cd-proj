@@ -1,4 +1,4 @@
-﻿# ir/c_gen.py - C code generator (scalar, C1)
+﻿# ir/c_gen.py - C code generator (scalar, C1 + arrays/pointers)
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend"))
@@ -29,12 +29,65 @@ class CGenerator:
         self.label_n += 1
         return "L%d" % self.label_n
 
+    def _lvalue_name(self, base):
+        """Return the variable name for a simple lvalue, else None.
+
+        The parser represents `i++` as either a bare name string (statement
+        form) or an ("Ident", name[, loc]) node (expression form).
+        """
+        base = _skip_loc(base)
+        if isinstance(base, str):
+            return base
+        if isinstance(base, tuple) and base and base[0] == "Ident":
+            return base[1]
+        return None
+
+    def gen_incdec(self, base, op, prefix, fn):
+        """Generate `++`/`--` for scalar or array-element lvalues.
+
+        Returns (address, type) of the resulting value: the new value for
+        prefix form, the old value for postfix form.
+        """
+        bop = "+" if op == "++" else "-"
+        name = self._lvalue_name(base)
+        if name is not None:
+            vtag = fn.var_types.get(name, "i32")
+            old = None
+            if not prefix:
+                old = self.new_temp()
+                fn.var_types[old] = vtag
+                fn.body.append(Instr("copy", name, None, old, ty=vtag))
+            tmp = self.new_temp()
+            fn.var_types[tmp] = vtag
+            fn.body.append(Instr(bop, name, 1, tmp, ty=vtag))
+            fn.body.append(Instr("copy", tmp, None, name, ty=vtag))
+            return (tmp if prefix else old), vtag
+        node = _skip_loc(base)
+        if isinstance(node, tuple) and node and node[0] == "Index":
+            arr_addr, _ = self.gen_expr(node[1], fn)
+            idx_addr, _ = self.gen_expr(node[2], fn)
+            old = self.new_temp()
+            fn.var_types[old] = "i32"
+            fn.body.append(Instr("load", arr_addr, idx_addr, old, ty="i32"))
+            new = self.new_temp()
+            fn.var_types[new] = "i32"
+            fn.body.append(Instr(bop, old, 1, new, ty="i32"))
+            fn.body.append(Instr("store", arr_addr, idx_addr, new, ty="i32"))
+            return (new if prefix else old), "i32"
+        # Unsupported lvalue shape: evaluate for its side effects only.
+        return self.gen_expr(node, fn)
+
     def gen_type_tag(self, ty):
         if isinstance(ty, CType):
             return ty.tag
         if isinstance(ty, tuple):
-            from frontend.c_types import parse_type_specifiers
-            return parse_type_specifiers(ty[1]).tag
+            if ty[0] == "Type":
+                from frontend.c_types import parse_type_specifiers
+                return parse_type_specifiers(ty[1]).tag
+            if ty[0] == "Array":
+                return "array%d" % ty[1]
+            if ty[0] == "Pointer":
+                return "ptr"
         return "i32"
 
     def generate(self, tu):
@@ -89,11 +142,8 @@ class CGenerator:
         if node[0] == "Block":
             for s in node[1]:
                 self.gen_stmt(s, fn)
-        else:
-            self.gen_stmt(node, fn)
 
     def _gen_cond_jump(self, cond_node, target_label, fn):
-        """Generate proper conditional jump: if x relop y goto L"""
         cond_node = _skip_loc(cond_node)
         if cond_node[0] == "BinOp" and cond_node[1] in ("<", ">", "<=", ">=", "==", "!="):
             op = cond_node[1]
@@ -121,11 +171,14 @@ class CGenerator:
             fn.body.append(Instr("if", left_addr, right_addr, target_label, op_relop=op, ty=ctag))
             return
         elif cond_node[0] == "BinOp" and cond_node[1] in ("&&", "||"):
-            # Logical ops - fall back to ifFalse for now
+            # Logical ops - evaluate the whole expression for now
             pass
-        # Fall back to ifFalse for complex conditions
+        # Fall back: jump when the condition is non-zero (true), matching the
+        # comparison case above.  Callers always pass the "jump when true"
+        # target, so the sense must be consistent for every kind of condition.
         cond_addr, cond_type = self.gen_expr(cond_node, fn)
-        fn.body.append(Instr("ifFalse", cond_addr, target_label, None))
+        fn.body.append(Instr("if", cond_addr, 0, target_label,
+                             op_relop="!=", ty=cond_type or "i32"))
 
     def gen_stmt(self, node, fn):
         node = _skip_loc(node)
@@ -137,7 +190,9 @@ class CGenerator:
             fn.var_types[name] = tag
             init = node[3]
             if init is None:
-                fn.body.append(Instr("copy", 0, None, name, ty=tag))
+                # Don't initialize arrays to 0 - in C, arrays are not zero-initialized by default
+                if not (isinstance(tag, str) and tag.startswith("array")):
+                    fn.body.append(Instr("copy", 0, None, name, ty=tag))
             else:
                 addr, t = self.gen_expr(init, fn)
                 if t != tag:
@@ -149,47 +204,52 @@ class CGenerator:
         elif kind == "ExprStmt":
             e = _skip_loc(node[1])
             if e[0] == "Assign":
-                op = e[1]; name = e[2]; expr = e[3]
-                addr, t = self.gen_expr(expr, fn)
-                vtag = fn.var_types.get(name, "i32")
-                if t != vtag:
-                    tmp = self.new_temp()
-                    fn.var_types[tmp] = vtag
-                    fn.body.append(Instr("cast", addr, None, tmp, ty=vtag))
-                    addr = tmp
-                if op == "=":
-                    fn.body.append(Instr("copy", addr, None, name, ty=vtag))
-                elif op == "+=":
-                    tmp = self.new_temp()
-                    fn.var_types[tmp] = vtag
-                    fn.body.append(Instr("+", name, addr, tmp, ty=vtag))
-                    fn.body.append(Instr("copy", tmp, None, name, ty=vtag))
-                elif op == "-=":
-                    tmp = self.new_temp()
-                    fn.var_types[tmp] = vtag
-                    fn.body.append(Instr("-", name, addr, tmp, ty=vtag))
-                    fn.body.append(Instr("copy", tmp, None, name, ty=vtag))
-                elif op == "*=":
-                    tmp = self.new_temp()
-                    fn.var_types[tmp] = vtag
-                    fn.body.append(Instr("*", name, addr, tmp, ty=vtag))
-                    fn.body.append(Instr("copy", tmp, None, name, ty=vtag))
-            elif e[0] == "IncDec":
-                op = e[1]; prefix = e[2]; name = e[3]
-                vtag = fn.var_types.get(name, "i32")
-                if prefix:
-                    tmp = self.new_temp()
-                    fn.var_types[tmp] = vtag
-                    fn.body.append(Instr("+", name, 1, tmp, ty=vtag))
-                    fn.body.append(Instr("copy", tmp, None, name, ty=vtag))
+                op = e[1]; lhs = e[2]; expr = e[3]
+                # Handle array assignment (lhs is Index node)
+                if lhs[0] == "Index":
+                    base = lhs[1]
+                    idx = lhs[2]
+                    base_addr, base_ty = self.gen_expr(base, fn)
+                    idx_addr, idx_ty = self.gen_expr(idx, fn)
+                    val_addr, val_ty = self.gen_expr(expr, fn)
+                    vtag = "i32"  # arrays are i32
+                    if val_ty != vtag:
+                        tmp = self.new_temp()
+                        fn.var_types[tmp] = vtag
+                        fn.body.append(Instr("cast", val_addr, None, tmp, ty=vtag))
+                        val_addr = tmp
+                    if op != "=":
+                        # Compound assignment: a[i] op= value -> load, op, store
+                        old = self.new_temp()
+                        fn.var_types[old] = vtag
+                        fn.body.append(Instr("load", base_addr, idx_addr, old, ty=vtag))
+                        new = self.new_temp()
+                        fn.var_types[new] = vtag
+                        fn.body.append(Instr(op[:-1], old, val_addr, new, ty=vtag))
+                        val_addr = new
+                    fn.body.append(Instr("store", base_addr, idx_addr, val_addr, ty=vtag))
                 else:
-                    old = self.new_temp()
-                    fn.var_types[old] = vtag
-                    fn.body.append(Instr("copy", name, None, old, ty=vtag))
-                    tmp = self.new_temp()
-                    fn.var_types[tmp] = vtag
-                    fn.body.append(Instr("+", name, 1, tmp, ty=vtag))
-                    fn.body.append(Instr("copy", tmp, None, name, ty=vtag))
+                    # Regular variable assignment
+                    name = self._lvalue_name(lhs)
+                    if name is None:
+                        raise ValueError("unsupported assignment target %r" % (lhs,))
+                    addr, t = self.gen_expr(expr, fn)
+                    vtag = fn.var_types.get(name, "i32")
+                    if t != vtag:
+                        tmp = self.new_temp()
+                        fn.var_types[tmp] = vtag
+                        fn.body.append(Instr("cast", addr, None, tmp, ty=vtag))
+                        addr = tmp
+                    if op == "=":
+                        fn.body.append(Instr("copy", addr, None, name, ty=vtag))
+                    else:
+                        bop = op[:-1]  # "+=" -> "+", etc.
+                        tmp = self.new_temp()
+                        fn.var_types[tmp] = vtag
+                        fn.body.append(Instr(bop, name, addr, tmp, ty=vtag))
+                        fn.body.append(Instr("copy", tmp, None, name, ty=vtag))
+            elif e[0] == "IncDec":
+                self.gen_incdec(e[3], e[1], e[2], fn)
             else:
                 addr, t = self.gen_expr(e, fn)
         elif kind == "If":
@@ -221,19 +281,32 @@ class CGenerator:
             fn.body.append(Instr("label", end_b, None, None))
         elif kind == "While":
             start = self.new_label()
+            body = self.new_label()
             end = self.new_label()
             fn.body.append(Instr("label", start, None, None))
-            cond_node = node[1]
-            self._gen_cond_jump(cond_node, end, fn)
+            # Jump to the body when the condition is true; otherwise exit.
+            self._gen_cond_jump(node[1], body, fn)
+            fn.body.append(Instr("goto", end, None, None))
+            fn.body.append(Instr("label", body, None, None))
             self.gen_stmt(node[2], fn)
             fn.body.append(Instr("goto", start, None, None))
             fn.body.append(Instr("label", end, None, None))
+        elif kind == "DoWhile":
+            start = self.new_label()
+            end = self.new_label()
+            fn.body.append(Instr("label", start, None, None))
+            body = self.gen_stmt(node[1], fn)
+            cond = node[2]
+            cond_addr, cond_type = self.gen_expr(node[2], fn)
+            fn.body.append(Instr("ifFalse", cond_addr, end, None))
+            fn.body.append(Instr("goto", start, None, None))
+            fn.body.append(Instr("label", end, None, None))
         elif kind == "For":
-            if node[1] is not None:
-                self._gen_for_init(node[1], fn)
             start = self.new_label()
             end = self.new_label()
             body = self.new_label()
+            if node[1] is not None:
+                self._gen_for_init(node[1], fn)
             fn.body.append(Instr("label", start, None, None))
             if node[2] is not None:
                 cond_node = node[2]
@@ -301,6 +374,9 @@ class CGenerator:
         node = _skip_loc(node)
         if node[0] == "VarDecl":
             self.gen_stmt(node, fn)
+        elif node[0] == "VarDecls":
+            for d in node[1]:
+                self.gen_stmt(d, fn)
         else:
             self.gen_stmt(("ExprStmt", node), fn)
 
@@ -325,6 +401,10 @@ class CGenerator:
                 fn.body.append(Instr("not", addr, None, tmp, ty=t))
             elif op == "~":
                 fn.body.append(Instr("bnot", addr, None, tmp, ty=t))
+            elif op == "*":
+                fn.body.append(Instr("load", addr, None, tmp, ty=t))
+            elif op == "&":
+                fn.body.append(Instr("addr", addr, None, tmp, ty=t))
             return tmp, t
         if kind == "BinOp":
             op = node[1]
@@ -388,26 +468,33 @@ class CGenerator:
             fn.body.append(Instr("call", node[1], len(arg_ops), tmp, ty="i32"))
             return tmp, "i32"
         if kind == "IncDec":
-            # as expression (prefix): return new value
-            op = node[1]; prefix = node[2]; name = node[3]
-            vtag = fn.var_types.get(name, "i32")
-            if prefix:
-                tmp = self.new_temp()
-                fn.var_types[tmp] = vtag
-                fn.body.append(Instr("+", name, 1, tmp, ty=vtag))
-                fn.body.append(Instr("copy", tmp, None, name, ty=vtag))
-                return tmp, vtag
+            return self.gen_incdec(node[3], node[1], node[2], fn)
+        if kind == "Index":
+            # array subscript: base[index]
+            base, base_ty = self.gen_expr(node[1], fn)
+            idx, idx_ty = self.gen_expr(node[2], fn)
+            tmp = self.new_temp()
+            # Check if base is array or pointer
+            if base_ty.startswith("array"):
+                # array[index] -> load
+                fn.var_types[tmp] = "i32"
+                fn.body.append(Instr("load", base, idx, tmp, ty="i32"))
             else:
-                old = self.new_temp()
-                fn.var_types[old] = vtag
-                fn.body.append(Instr("copy", name, None, old, ty=vtag))
-                tmp = self.new_temp()
-                fn.var_types[tmp] = vtag
-                fn.body.append(Instr("+", name, 1, tmp, ty=vtag))
-                fn.body.append(Instr("copy", tmp, None, name, ty=vtag))
-                return old, vtag
+                # pointer arithmetic: base + index * sizeof(elem)
+                # For now, treat as load
+                fn.var_types[tmp] = "i32"
+                fn.body.append(Instr("load", base, idx, tmp, ty="i32"))
+            return tmp, "i32"
+        if kind == "Arrow":
+            # ptr->member: treated as (*ptr).member
+            # For now, just load from the pointer
+            base, base_ty = self.gen_expr(node[1], fn)
+            member = node[2]
+            tmp = self.new_temp()
+            fn.var_types[tmp] = "i32"
+            fn.body.append(Instr("load", base, member, tmp, ty="i32"))
+            return tmp, "i32"
         raise ValueError("unknown expr %s" % kind)
-
 
 def generate_c(tu):
     g = CGenerator()

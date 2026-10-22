@@ -2,18 +2,41 @@
 from dataclasses import dataclass, field
 import re
 
+
+def default_value(ty):
+    """The initial contents of a variable of this type.
+
+    Arrays get a (possibly nested) list of zeroes.  A scalar local is left
+    undefined until the program assigns to it, which the interpreter tracks
+    by leaving the slot empty rather than by using this helper.
+    """
+    if ty is not None and getattr(ty, "kind", None) == "array":
+        return [default_value(ty.elem) for _ in range(ty.count or 0)]
+    return 0
+
+
+def is_array_type(ty):
+    """True for an array type (a Type object or a legacy string tag)."""
+    if ty is None:
+        return False
+    if getattr(ty, "kind", None) == "array":
+        return True
+    return isinstance(ty, str) and ty.startswith("array")
+
+
 @dataclass
 class Function:
     name: str
-    params: list = field(default_factory=list)   # list of (name, ty)
-    ret_ty: str = None                          # None for void
+    params: list = field(default_factory=list)   # list of (name, Type)
+    ret_ty: object = None                        # Type, or None for void
     body: list = field(default_factory=list)     # list of Instr
-    var_types: dict = field(default_factory=dict)
+    var_types: dict = field(default_factory=dict)  # name -> Type
+
 
 @dataclass
 class Program:
     functions: dict = field(default_factory=dict)  # name -> Function
-    globals: dict = field(default_factory=dict)    # name -> (ty, init_value)
+    globals: dict = field(default_factory=dict)    # name -> (Type, init_value)
 
     @classmethod
     def from_legacy(cls, tac):

@@ -1,17 +1,13 @@
-﻿# frontend/c_sema.py - semantic analysis (C1, scalar + main + arrays/pointers)
+﻿# frontend/c_sema.py - semantic analysis (scopes, types, lvalues)
 import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
-from c_types import parse_type_specifiers, common_type, CType, VOID, is_array_type, is_pointer_type, get_array_info, get_pointer_base, type_to_tag
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+from frontend.c_types import (Type, common_type, VOID, type_from_tag,
+                              layout_record)
+from frontend.errors import SemanticError, UnsupportedFeatureError
 
-class SemanticError(Exception):
-    def __init__(self, line, col, msg):
-        self.line = line; self.col = col; self.msg = msg
-        super().__init__("%d:%d: %s" % (line, col, msg))
+__all__ = ["SemanticError", "UnsupportedFeatureError", "Sema", "analyze"]
 
-class UnsupportedFeatureError(Exception):
-    def __init__(self, feature, line, col):
-        self.feature = feature; self.line = line; self.col = col
-        super().__init__("%d:%d: unsupported: %s" % (line, col, feature))
 
 def _get_loc(node):
     """Extract (line, col) from AST node. Returns (0, 0) if not found."""
@@ -22,6 +18,7 @@ def _get_loc(node):
             return last
     return (0, 0)
 
+
 def _strip_loc(node):
     """Remove a trailing (line, col) tuple from a node, if present."""
     if isinstance(node, tuple) and len(node) > 0:
@@ -29,6 +26,7 @@ def _strip_loc(node):
         if isinstance(last, tuple) and len(last) == 2 and all(isinstance(x, int) for x in last):
             return node[:-1]
     return node
+
 
 class Sema:
     def __init__(self):
@@ -70,14 +68,23 @@ class Sema:
                 return scope[name]
         raise SemanticError(line, col, "undeclared identifier %s" % name)
 
+    def _complete_type(self, ty, init, loc):
+        """Finish an incomplete array type from its initialiser."""
+        if ty.kind != "array":
+            raise SemanticError(loc[0], loc[1], "invalid initializer")
+        if ty.count is None:
+            return Type.array(ty.elem, len(init[1]))
+        if len(init[1]) > ty.count:
+            raise SemanticError(loc[0], loc[1], "too many initializers")
+        return ty
+
     def annotate_expr(self, node):
         kind = node[0]
         loc = _get_loc(node)
         if kind == "IntLit":
-            ty = _tag_to_ctype(node[2])
-            return node, ty
+            return node, type_from_tag(node[2])
         if kind == "CharLit":
-            return node, CType(32, True)
+            return node, Type("scalar", bits=32, signed=True)
         if kind == "Ident":
             uniq, ty = self.lookup(node[1], loc[0], loc[1])
             # rewrite node to unique
@@ -86,29 +93,27 @@ class Sema:
         if kind == "StringLit":
             return node, None
         if kind == "Cast":
-            specs = node[1][1]
-            ty = parse_type_specifiers(specs)
+            ty = node[1]
             e, et = self.annotate_expr(node[2])
             return ("Cast", ty, e), ty
         if kind == "Unary":
             e, et = self.annotate_expr(node[2])
             op = node[1]
             if op == "!":
-                return ("Unary", op, e), CType(32, True)
+                return ("Unary", op, e), Type("scalar", bits=32, signed=True)
             if op == "*":
-                # dereference
-                if is_pointer_type(et):
-                    base_ty = get_pointer_base(et)
-                    return ("Unary", op, e), base_ty
+                # dereference: the operand may be a pointer or an array
+                if et is not None and et.kind == "pointer":
+                    return ("Unary", op, e), et.pointee
+                if et is not None and et.kind == "array":
+                    return ("Unary", op, e), et.elem
                 raise SemanticError(loc[0], loc[1], "dereference of non-pointer")
             if op == "&":
-                # address-of
-                if is_array_type(et):
-                    # array decays to pointer
-                    base_ty = get_array_info(et)[1]
-                    return ("Unary", op, e), ("Pointer", base_ty)
-                if isinstance(et, CType):
-                    return ("Unary", op, e), ("Pointer", et)
+                # address-of: &arr is a pointer to the whole array
+                if et is not None and et.kind == "array":
+                    return ("Unary", op, e), Type.pointer(et)
+                if isinstance(et, Type) and et.kind != "void":
+                    return ("Unary", op, e), Type.pointer(et)
                 raise SemanticError(loc[0], loc[1], "address-of non-lvalue")
             return ("Unary", op, e), et
         if kind == "IncDec":
@@ -128,20 +133,20 @@ class Sema:
             elif isinstance(lhs, tuple):
                 lhs, lty = self.annotate_expr(_strip_loc(lhs))
             else:
-                lty = CType(32, True)
+                lty = Type("scalar", bits=32, signed=True)
             rhs, rty = self.annotate_expr(node[3])
-            return ("Assign", op, lhs, rhs), (rty or lty or CType(32, True))
+            return ("Assign", op, lhs, rhs), (rty or lty or Type("scalar", bits=32, signed=True))
         if kind == "BinOp":
             l, lt = self.annotate_expr(node[2])
             r, rt = self.annotate_expr(node[3])
             if lt is None or rt is None:
-                return ("BinOp", node[1], l, r), CType(32, True)
+                return ("BinOp", node[1], l, r), Type("scalar", bits=32, signed=True)
             if node[1] in ("&&", "||"):
-                return ("BinOp", node[1], l, r), CType(32, True)
+                return ("BinOp", node[1], l, r), Type("scalar", bits=32, signed=True)
             if node[1] in ("<<", ">>"):
                 return ("BinOp", node[1], l, r), lt
             if node[1] in ("<", ">", "<=", ">=", "==", "!="):
-                return ("BinOp", node[1], l, r), CType(32, True)
+                return ("BinOp", node[1], l, r), Type("scalar", bits=32, signed=True)
             ct = common_type(lt, rt)
             return ("BinOp", node[1], l, r), ct
         if kind == "Ternary":
@@ -154,56 +159,58 @@ class Sema:
             return ("Ternary", c, t, f), ct2
         if kind == "Call":
             name = node[1]
-            if name not in self.functions:
-                # builtin
-                pass
             args = []
-            argtypes = []
             for a in node[2]:
                 an, at = self.annotate_expr(a)
                 args.append(an)
-                argtypes.append(at)
-            return ("Call", name, args), CType(32, True)
+            if name in self.functions:
+                ret = self.functions[name][0]
+            else:
+                # builtin (printf, putchar, ...)
+                ret = Type("scalar", bits=32, signed=True)
+            return ("Call", name, args), ret
         if kind == "Index":
             # array subscript: base[index]
             base, bt = self.annotate_expr(node[1])
             idx, it = self.annotate_expr(node[2])
-            if is_array_type(bt):
-                elem_ty = get_array_info(bt)[1]
-                return ("Index", base, idx), elem_ty
-            if is_pointer_type(bt):
-                # pointer arithmetic
-                base_ty = get_pointer_base(bt)
-                return ("Index", base, idx), base_ty
+            if bt is not None and bt.kind == "array":
+                return ("Index", base, idx), bt.elem
+            if bt is not None and bt.kind == "pointer":
+                return ("Index", base, idx), bt.pointee
             raise SemanticError(loc[0], loc[1], "subscripted value is not an array or pointer")
         if kind == "Arrow":
             # ptr->member
             base, bt = self.annotate_expr(node[1])
             member = node[2]
-            # For now, just treat as base type
-            if is_pointer_type(bt):
-                base_ty = get_pointer_base(bt)
-                return ("Arrow", base, member), base_ty
+            if bt is not None and bt.kind == "pointer":
+                return ("Arrow", base, member), bt.pointee
             raise SemanticError(loc[0], loc[1], "arrow on non-pointer")
-        return node, CType(32, True)
+        if kind == "Member":
+            # obj.member -- needs a record type, which the front end does not
+            # build yet.
+            raise UnsupportedFeatureError("record member access", loc[0], loc[1])
+        return node, Type("scalar", bits=32, signed=True)
 
     def analyze_decl(self, node, is_global=False):
         loc = _get_loc(node)
-        # node[1] is the type from parser, which can be:
-        # - ("Type", specs) for basic types
-        # - ("Array", size, base_type) for arrays
-        # - ("Pointer", base_type) for pointers
-        # We use it directly as the type
+        # node[1] is the declared type, already a Type built by the parser.
         ty = node[1]
         name = node[2]
         uniq = self.declare(name, ty, loc[0], loc[1], is_global=is_global)
         init = node[3]
+        if init is not None and init[0] == "InitList":
+            ty = self._complete_type(ty, init, loc)
+            self.scopes[-1][name] = (uniq, ty)
+            items = [self.annotate_expr(e)[0] for e in init[1]]
+            return ("VarDecl", ty, uniq, ("InitList", items))
         if init is not None:
             ie, it = self.annotate_expr(init)
-            node = ("VarDecl", ty, uniq, ie)
-        else:
-            node = ("VarDecl", ty, uniq, None)
-        return node
+            return ("VarDecl", ty, uniq, ie)
+        if ty.kind == "array" and ty.count is None:
+            # an incomplete array with no initialiser: give it one element
+            ty = Type.array(ty.elem, 1)
+            self.scopes[-1][name] = (uniq, ty)
+        return ("VarDecl", ty, uniq, None)
 
     def analyze_stmt(self, node):
         kind = node[0]
@@ -287,19 +294,16 @@ class Sema:
         return node
 
     def analyze_func(self, node):
-        ty = node[1]
-        ret_ty = parse_type_specifiers(ty[1])
+        ret_ty = node[1]
         name = node[2]
         loc = _get_loc(node)
         if name in self.functions:
             raise SemanticError(loc[0], loc[1], "redefinition of %s" % name)
-        self.functions[name] = (ret_ty, node[3])
-        # params
         self.current_func_ret = ret_ty
         self.enter_scope()
         params = []
         for p in node[3]:
-            pty = parse_type_specifiers(p[0][1])
+            pty = p[0]
             uniq = self.declare(p[1], pty, p[2][0], p[2][1])
             params.append((uniq, pty))
         self.functions[name] = (ret_ty, params)
@@ -314,16 +318,20 @@ class Sema:
             if d[0] == "FuncDef":
                 new_decls.append(self.analyze_func(d))
             elif d[0] == "GlobalVar":
-                ty = parse_type_specifiers(d[1][1])
+                ty = d[1]
                 name = d[2]
                 loc = _get_loc(d)
-                uniq = self.declare(name, ty, loc[0], loc[1], is_global=True)
                 init = d[3]
-                if init is not None:
-                    ie, _ = self.annotate_expr(init)
-                    new_decls.append(("GlobalVar", ty, uniq, ie, loc))
-                else:
-                    new_decls.append(("GlobalVar", ty, uniq, None, loc))
+                if init is not None and init[0] == "InitList":
+                    ty = self._complete_type(ty, init, loc)
+                    items = [self.annotate_expr(e)[0] for e in init[1]]
+                    init = ("InitList", items)
+                elif init is not None:
+                    init, _ = self.annotate_expr(init)
+                elif ty.kind == "array" and ty.count is None:
+                    ty = Type.array(ty.elem, 1)
+                uniq = self.declare(name, ty, loc[0], loc[1], is_global=True)
+                new_decls.append(("GlobalVar", ty, uniq, init, loc))
             else:
                 new_decls.append(d)
         # require main
@@ -331,13 +339,6 @@ class Sema:
             raise SemanticError(0, 0, "missing main")
         return ("TU", new_decls)
 
-def _tag_to_ctype(tag):
-    from c_types import CType
-    if tag.startswith("i"):
-        return CType(int(tag[1:]), True)
-    if tag.startswith("u"):
-        return CType(int(tag[1:]), False)
-    return CType(32, True)
 
 def analyze(src_ast):
     sema = Sema()

@@ -1,10 +1,12 @@
 ﻿# ir/c_gen.py - C code generator (scalar, C1 + arrays/pointers)
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend"))
-from tac import Instr
+from ir.tac import Instr
 from ir.program import Program, Function
-from frontend.c_types import CType
+from frontend.c_types import Type, common_type, type_from_tag
+
+INT = Type("scalar", bits=32, signed=True)
+
 
 def _skip_loc(node):
     """If last element is a (line, col) tuple, return node without it."""
@@ -42,6 +44,29 @@ class CGenerator:
             return base[1]
         return None
 
+    def _elem_type(self, base_ty):
+        """The element type of an indexable base (array or pointer)."""
+        if base_ty is None:
+            return INT
+        if base_ty.kind == "array":
+            return base_ty.elem
+        if base_ty.kind == "pointer":
+            return base_ty.pointee
+        return INT
+
+    def _cast_if_needed(self, addr, src_ty, dst_ty, fn):
+        """Cast a value to `dst_ty` when both are scalars and differ."""
+        if dst_ty is None or src_ty is None:
+            return addr
+        if src_ty == dst_ty:
+            return addr
+        if not (src_ty.is_scalar and dst_ty.is_scalar):
+            return addr
+        tmp = self.new_temp()
+        fn.var_types[tmp] = dst_ty
+        fn.body.append(Instr("cast", addr, None, tmp, ty=dst_ty))
+        return tmp
+
     def gen_incdec(self, base, op, prefix, fn):
         """Generate `++`/`--` for scalar or array-element lvalues.
 
@@ -51,44 +76,32 @@ class CGenerator:
         bop = "+" if op == "++" else "-"
         name = self._lvalue_name(base)
         if name is not None:
-            vtag = fn.var_types.get(name, "i32")
+            vty = fn.var_types.get(name, INT)
             old = None
             if not prefix:
                 old = self.new_temp()
-                fn.var_types[old] = vtag
-                fn.body.append(Instr("copy", name, None, old, ty=vtag))
+                fn.var_types[old] = vty
+                fn.body.append(Instr("copy", name, None, old, ty=vty))
             tmp = self.new_temp()
-            fn.var_types[tmp] = vtag
-            fn.body.append(Instr(bop, name, 1, tmp, ty=vtag))
-            fn.body.append(Instr("copy", tmp, None, name, ty=vtag))
-            return (tmp if prefix else old), vtag
+            fn.var_types[tmp] = vty
+            fn.body.append(Instr(bop, name, 1, tmp, ty=vty))
+            fn.body.append(Instr("copy", tmp, None, name, ty=vty))
+            return (tmp if prefix else old), vty
         node = _skip_loc(base)
         if isinstance(node, tuple) and node and node[0] == "Index":
-            arr_addr, _ = self.gen_expr(node[1], fn)
-            idx_addr, _ = self.gen_expr(node[2], fn)
+            arr_addr, arr_ty = self.gen_expr(node[1], fn)
+            idx_addr, idx_ty = self.gen_expr(node[2], fn)
+            elem_ty = self._elem_type(arr_ty)
             old = self.new_temp()
-            fn.var_types[old] = "i32"
-            fn.body.append(Instr("load", arr_addr, idx_addr, old, ty="i32"))
+            fn.var_types[old] = elem_ty
+            fn.body.append(Instr("load", arr_addr, idx_addr, old, ty=elem_ty))
             new = self.new_temp()
-            fn.var_types[new] = "i32"
-            fn.body.append(Instr(bop, old, 1, new, ty="i32"))
-            fn.body.append(Instr("store", arr_addr, idx_addr, new, ty="i32"))
-            return (new if prefix else old), "i32"
+            fn.var_types[new] = elem_ty
+            fn.body.append(Instr(bop, old, 1, new, ty=elem_ty))
+            fn.body.append(Instr("store", arr_addr, idx_addr, new, ty=elem_ty))
+            return (new if prefix else old), elem_ty
         # Unsupported lvalue shape: evaluate for its side effects only.
         return self.gen_expr(node, fn)
-
-    def gen_type_tag(self, ty):
-        if isinstance(ty, CType):
-            return ty.tag
-        if isinstance(ty, tuple):
-            if ty[0] == "Type":
-                from frontend.c_types import parse_type_specifiers
-                return parse_type_specifiers(ty[1]).tag
-            if ty[0] == "Array":
-                return "array%d" % ty[1]
-            if ty[0] == "Pointer":
-                return "ptr"
-        return "i32"
 
     def generate(self, tu):
         prog = Program()
@@ -99,13 +112,14 @@ class CGenerator:
                 prog.functions[fn.name] = fn
             elif decl[0] == "GlobalVar":
                 ty = decl[1]
-                tag = self.gen_type_tag(ty)
                 init = decl[3]
                 val = 0
                 if init is not None:
-                    # constant fold simple
-                    val = init[1] if init[0] == "IntLit" else 0
-                prog.globals[decl[2]] = (tag, val)
+                    if init[0] == "IntLit":
+                        val = init[1]
+                    elif init[0] == "InitList":
+                        val = [self._const_value(item) for item in init[1]]
+                prog.globals[decl[2]] = (ty, val)
         if "main" not in prog.functions:
             # wrap? assume present
             pass
@@ -114,27 +128,22 @@ class CGenerator:
     def gen_func(self, node):
         node = _skip_loc(node)
         ret_ty = node[1]
-        ret_tag = self.gen_type_tag(ret_ty) if not isinstance(ret_ty, str) else ret_ty
-        if isinstance(ret_ty, tuple):
-            from frontend.c_types import parse_type_specifiers
-            ret_tag = parse_type_specifiers(ret_ty[1]).tag
         name = node[2]
         params = node[3]
         body_node = node[4]
-        fn = Function(name=name, params=[], ret_ty=ret_tag, body=[], var_types={})
+        fn = Function(name=name, params=[], ret_ty=ret_ty, body=[], var_types={})
         self.var_types = fn.var_types
         # params
         for p in params:
             p = _skip_loc(p)
             uniq, pty = p[0], p[1]
-            ptag = self.gen_type_tag(pty)
-            fn.params.append((uniq, ptag))
-            fn.var_types[uniq] = ptag
+            fn.params.append((uniq, pty))
+            fn.var_types[uniq] = pty
         # body
         self.gen_block(body_node, fn)
         # implicit return
-        if ret_tag != "void":
-            fn.body.append(Instr("return", 0, None, None, ty=ret_tag))
+        if ret_ty is not None and not ret_ty.is_void:
+            fn.body.append(Instr("return", 0, None, None, ty=ret_ty))
         return fn
 
     def gen_block(self, node, fn):
@@ -152,23 +161,11 @@ class CGenerator:
             left_addr, left_type = self.gen_expr(left_node, fn)
             right_addr, right_type = self.gen_expr(right_node, fn)
             # Cast to common type if needed
-            from frontend.c_types import common_type, CType
-            def to_ct(ty):
-                if isinstance(ty, CType): return ty
-                if isinstance(ty, str):
-                    bits = int(ty[1:]) if ty[1:].isdigit() else 32
-                    return CType(bits, ty.startswith("i"))
-                return CType(32, True)
-            ct = common_type(to_ct(left_type), to_ct(right_type))
-            ctag = ct.tag
-            if left_type != ctag:
-                tmp = self.new_temp(); fn.var_types[tmp] = ctag
-                fn.body.append(Instr("cast", left_addr, None, tmp, ty=ctag)); left_addr = tmp
-            if right_type != ctag:
-                tmp = self.new_temp(); fn.var_types[tmp] = ctag
-                fn.body.append(Instr("cast", right_addr, None, tmp, ty=ctag)); right_addr = tmp
+            ct = common_type(left_type, right_type)
+            left_addr = self._cast_if_needed(left_addr, left_type, ct, fn)
+            right_addr = self._cast_if_needed(right_addr, right_type, ct, fn)
             # Generate proper conditional jump: if left op right goto target
-            fn.body.append(Instr("if", left_addr, right_addr, target_label, op_relop=op, ty=ctag))
+            fn.body.append(Instr("if", left_addr, right_addr, target_label, op_relop=op, ty=ct))
             return
         elif cond_node[0] == "BinOp" and cond_node[1] in ("&&", "||"):
             # Logical ops - evaluate the whole expression for now
@@ -178,29 +175,26 @@ class CGenerator:
         # target, so the sense must be consistent for every kind of condition.
         cond_addr, cond_type = self.gen_expr(cond_node, fn)
         fn.body.append(Instr("if", cond_addr, 0, target_label,
-                             op_relop="!=", ty=cond_type or "i32"))
+                             op_relop="!=", ty=cond_type or INT))
 
     def gen_stmt(self, node, fn):
         node = _skip_loc(node)
         kind = node[0]
         if kind == "VarDecl":
             ty = node[1]
-            tag = self.gen_type_tag(ty)
             name = node[2]
-            fn.var_types[name] = tag
+            fn.var_types[name] = ty
             init = node[3]
             if init is None:
                 # Don't initialize arrays to 0 - in C, arrays are not zero-initialized by default
-                if not (isinstance(tag, str) and tag.startswith("array")):
-                    fn.body.append(Instr("copy", 0, None, name, ty=tag))
+                if not ty.is_array:
+                    fn.body.append(Instr("copy", 0, None, name, ty=ty))
+            elif init[0] == "InitList":
+                self._gen_init_list(init[1], name, ty, fn)
             else:
                 addr, t = self.gen_expr(init, fn)
-                if t != tag:
-                    tmp = self.new_temp()
-                    fn.var_types[tmp] = tag
-                    fn.body.append(Instr("cast", addr, None, tmp, ty=tag))
-                    addr = tmp
-                fn.body.append(Instr("copy", addr, None, name, ty=tag))
+                addr = self._cast_if_needed(addr, t, ty, fn)
+                fn.body.append(Instr("copy", addr, None, name, ty=ty))
         elif kind == "ExprStmt":
             e = _skip_loc(node[1])
             if e[0] == "Assign":
@@ -212,42 +206,34 @@ class CGenerator:
                     base_addr, base_ty = self.gen_expr(base, fn)
                     idx_addr, idx_ty = self.gen_expr(idx, fn)
                     val_addr, val_ty = self.gen_expr(expr, fn)
-                    vtag = "i32"  # arrays are i32
-                    if val_ty != vtag:
-                        tmp = self.new_temp()
-                        fn.var_types[tmp] = vtag
-                        fn.body.append(Instr("cast", val_addr, None, tmp, ty=vtag))
-                        val_addr = tmp
+                    elem_ty = self._elem_type(base_ty)
+                    val_addr = self._cast_if_needed(val_addr, val_ty, elem_ty, fn)
                     if op != "=":
                         # Compound assignment: a[i] op= value -> load, op, store
                         old = self.new_temp()
-                        fn.var_types[old] = vtag
-                        fn.body.append(Instr("load", base_addr, idx_addr, old, ty=vtag))
+                        fn.var_types[old] = elem_ty
+                        fn.body.append(Instr("load", base_addr, idx_addr, old, ty=elem_ty))
                         new = self.new_temp()
-                        fn.var_types[new] = vtag
-                        fn.body.append(Instr(op[:-1], old, val_addr, new, ty=vtag))
+                        fn.var_types[new] = elem_ty
+                        fn.body.append(Instr(op[:-1], old, val_addr, new, ty=elem_ty))
                         val_addr = new
-                    fn.body.append(Instr("store", base_addr, idx_addr, val_addr, ty=vtag))
+                    fn.body.append(Instr("store", base_addr, idx_addr, val_addr, ty=elem_ty))
                 else:
                     # Regular variable assignment
                     name = self._lvalue_name(lhs)
                     if name is None:
                         raise ValueError("unsupported assignment target %r" % (lhs,))
                     addr, t = self.gen_expr(expr, fn)
-                    vtag = fn.var_types.get(name, "i32")
-                    if t != vtag:
-                        tmp = self.new_temp()
-                        fn.var_types[tmp] = vtag
-                        fn.body.append(Instr("cast", addr, None, tmp, ty=vtag))
-                        addr = tmp
+                    vty = fn.var_types.get(name, INT)
+                    addr = self._cast_if_needed(addr, t, vty, fn)
                     if op == "=":
-                        fn.body.append(Instr("copy", addr, None, name, ty=vtag))
+                        fn.body.append(Instr("copy", addr, None, name, ty=vty))
                     else:
                         bop = op[:-1]  # "+=" -> "+", etc.
                         tmp = self.new_temp()
-                        fn.var_types[tmp] = vtag
-                        fn.body.append(Instr(bop, name, addr, tmp, ty=vtag))
-                        fn.body.append(Instr("copy", tmp, None, name, ty=vtag))
+                        fn.var_types[tmp] = vty
+                        fn.body.append(Instr(bop, name, addr, tmp, ty=vty))
+                        fn.body.append(Instr("copy", tmp, None, name, ty=vty))
             elif e[0] == "IncDec":
                 self.gen_incdec(e[3], e[1], e[2], fn)
             else:
@@ -296,7 +282,6 @@ class CGenerator:
             end = self.new_label()
             fn.body.append(Instr("label", start, None, None))
             body = self.gen_stmt(node[1], fn)
-            cond = node[2]
             cond_addr, cond_type = self.gen_expr(node[2], fn)
             fn.body.append(Instr("ifFalse", cond_addr, end, None))
             fn.body.append(Instr("goto", start, None, None))
@@ -310,7 +295,7 @@ class CGenerator:
             fn.body.append(Instr("label", start, None, None))
             if node[2] is not None:
                 cond_node = node[2]
-                # For loops: jump to body when condition is TRUE, else fall through to end
+                # For loops: jump to body when condition is TRUE, else jump to end
                 self._gen_cond_jump(cond_node, body, fn)
                 # If condition is false, jump to end
                 fn.body.append(Instr("goto", end, None, None))
@@ -357,11 +342,11 @@ class CGenerator:
                 fn.body.append(Instr("param", addr, None, None, ty=t))
             # Emit call to printf
             tmp = self.new_temp()
-            fn.var_types[tmp] = "i32"
-            fn.body.append(Instr("call", "printf", len(args) + 1, tmp, ty="i32"))
+            fn.var_types[tmp] = INT
+            fn.body.append(Instr("call", "printf", len(args) + 1, tmp, ty=INT))
         elif kind == "Putchar":
             addr, t = self.gen_expr(node[1], fn)
-            fn.body.append(Instr("out_val", addr, "c", None, ty="i32"))
+            fn.body.append(Instr("out_val", addr, "c", None, ty=INT))
         elif kind == "Empty":
             pass
         else:
@@ -369,6 +354,23 @@ class CGenerator:
                 addr, t = self.gen_expr(node, fn)
             except Exception:
                 pass
+
+    def _const_value(self, node):
+        """The constant value of an initialiser expression, or 0."""
+        node = _skip_loc(node)
+        if node[0] == "IntLit":
+            return node[1]
+        if node[0] == "CharLit":
+            return node[1]
+        return 0
+
+    def _gen_init_list(self, items, name, ty, fn):
+        """Initialise an array from a brace-enclosed list of values."""
+        elem_ty = ty.elem if ty.kind == "array" else INT
+        for i, item in enumerate(items):
+            addr, t = self.gen_expr(item, fn)
+            addr = self._cast_if_needed(addr, t, elem_ty, fn)
+            fn.body.append(Instr("store", name, i, addr, ty=elem_ty))
 
     def _gen_for_init(self, node, fn):
         node = _skip_loc(node)
@@ -384,12 +386,12 @@ class CGenerator:
         node = _skip_loc(node)
         kind = node[0]
         if kind == "IntLit":
-            return node[1], node[2]
+            return node[1], type_from_tag(node[2])
         if kind == "CharLit":
-            return node[1], "i32"
+            return node[1], INT
         if kind == "Ident":
             name = node[1]
-            return name, fn.var_types.get(name, "i32")
+            return name, fn.var_types.get(name, INT)
         if kind == "Unary":
             addr, t = self.gen_expr(node[2], fn)
             tmp = self.new_temp()
@@ -411,33 +413,20 @@ class CGenerator:
             la, lt = self.gen_expr(node[2], fn)
             ra, rt = self.gen_expr(node[3], fn)
             # cast to common type
-            from frontend.c_types import common_type, CType
-            def to_ct(ty):
-                if isinstance(ty, CType): return ty
-                if isinstance(ty, str):
-                    bits = int(ty[1:]) if ty[1:].isdigit() else 32
-                    return CType(bits, ty.startswith("i"))
-                return CType(32, True)
-            ct = common_type(to_ct(lt), to_ct(rt))
-            ctag = ct.tag
-            if lt != ctag:
-                tmp = self.new_temp(); fn.var_types[tmp] = ctag
-                fn.body.append(Instr("cast", la, None, tmp, ty=ctag)); la = tmp
-            if rt != ctag:
-                tmp = self.new_temp(); fn.var_types[tmp] = ctag
-                fn.body.append(Instr("cast", ra, None, tmp, ty=ctag)); ra = tmp
+            ct = common_type(lt, rt)
+            la = self._cast_if_needed(la, lt, ct, fn)
+            ra = self._cast_if_needed(ra, rt, ct, fn)
             tmp = self.new_temp()
-            fn.var_types[tmp] = ctag
-            fn.body.append(Instr(op, la, ra, tmp, ty=ctag))
-            return tmp, ctag
+            fn.var_types[tmp] = ct
+            fn.body.append(Instr(op, la, ra, tmp, ty=ct))
+            return tmp, ct
         if kind == "Cast":
             ty = node[1]
-            tag = self.gen_type_tag(ty)
             addr, t = self.gen_expr(node[2], fn)
             tmp = self.new_temp()
-            fn.var_types[tmp] = tag
-            fn.body.append(Instr("cast", addr, None, tmp, ty=tag))
-            return tmp, tag
+            fn.var_types[tmp] = ty
+            fn.body.append(Instr("cast", addr, None, tmp, ty=ty))
+            return tmp, ty
         if kind == "Ternary":
             cond, ct = self.gen_expr(node[1], fn)
             tmp = self.new_temp()
@@ -464,37 +453,26 @@ class CGenerator:
                 fn.body.append(Instr("param", ao, None, None, ty=at))
             # emit call
             tmp = self.new_temp()
-            fn.var_types[tmp] = "i32"
-            fn.body.append(Instr("call", node[1], len(arg_ops), tmp, ty="i32"))
-            return tmp, "i32"
+            fn.var_types[tmp] = INT
+            fn.body.append(Instr("call", node[1], len(arg_ops), tmp, ty=INT))
+            return tmp, INT
         if kind == "IncDec":
             return self.gen_incdec(node[3], node[1], node[2], fn)
         if kind == "Index":
             # array subscript: base[index]
             base, base_ty = self.gen_expr(node[1], fn)
             idx, idx_ty = self.gen_expr(node[2], fn)
+            elem_ty = self._elem_type(base_ty)
             tmp = self.new_temp()
-            # Check if base is array or pointer
-            if base_ty.startswith("array"):
-                # array[index] -> load
-                fn.var_types[tmp] = "i32"
-                fn.body.append(Instr("load", base, idx, tmp, ty="i32"))
-            else:
-                # pointer arithmetic: base + index * sizeof(elem)
-                # For now, treat as load
-                fn.var_types[tmp] = "i32"
-                fn.body.append(Instr("load", base, idx, tmp, ty="i32"))
-            return tmp, "i32"
+            fn.var_types[tmp] = elem_ty
+            fn.body.append(Instr("load", base, idx, tmp, ty=elem_ty))
+            return tmp, elem_ty
         if kind == "Arrow":
-            # ptr->member: treated as (*ptr).member
-            # For now, just load from the pointer
-            base, base_ty = self.gen_expr(node[1], fn)
-            member = node[2]
-            tmp = self.new_temp()
-            fn.var_types[tmp] = "i32"
-            fn.body.append(Instr("load", base, member, tmp, ty="i32"))
-            return tmp, "i32"
+            raise ValueError("pointer member access is not supported yet")
+        if kind == "Member":
+            raise ValueError("record member access is not supported yet")
         raise ValueError("unknown expr %s" % kind)
+
 
 def generate_c(tu):
     g = CGenerator()

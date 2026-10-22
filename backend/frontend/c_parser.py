@@ -1,8 +1,10 @@
 ﻿# frontend/c_parser.py - C parser (C1, scalar + main + arrays/pointers)
 import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from c_lexer import lex_c, CToken, CLexError
 from preprocess import PreprocessError
+from frontend.c_types import Type, parse_type_specifiers
 
 class CParseError(Exception):
     def __init__(self, line, col, msg):
@@ -68,7 +70,7 @@ class Parser:
             init = None
             if self.peek().kind == "OP" and self.peek().value == "=":
                 self.advance()
-                init = self.parse_expr()
+                init = self._parse_init()
             decls.append(("GlobalVar", dty, name, init, name_loc))
             if self.peek().kind == "OP" and self.peek().value == ",":
                 self.advance()
@@ -83,45 +85,86 @@ class Parser:
             specs.append(self.advance().value)
         if not specs:
             raise CParseError(self.peek().line, self.peek().col, "expected type")
-        return ("Type", specs)
+        return parse_type_specifiers(specs)
 
-    def parse_declarator(self, base_type):
-        """Parse declarator with possible pointer/array modifiers"""
-        # Handle pointer declarators (*)
-        ptr_level = 0
+    def _parse_array_suffixes(self):
+        """Parse the `[n]` suffixes of a declarator, outermost first."""
+        sizes = []
+        while self.peek().kind == "OP" and self.peek().value == "[":
+            self.advance()
+            if self.peek().kind == "INT_LIT":
+                sizes.append(self.advance().value)
+            else:
+                # `[]`, or a size that is not a literal: incomplete for now
+                sizes.append(None)
+            self.expect("OP", "]")
+        return sizes
+
+    def _parse_declarator(self):
+        """Parse a declarator.
+
+        Returns (name, loc, wrap) where `wrap(base_type)` builds the declared
+        type.  A pointer prefix binds looser than an array suffix, so
+        `int *a[10]` is an array of ten pointers, and a parenthesised
+        declarator such as `int (*p)[10]` is a pointer to an array.
+        """
+        ptrs = 0
         while self.peek().kind == "OP" and self.peek().value == "*":
             self.advance()
-            ptr_level += 1
-
-        # Must have identifier
+            ptrs += 1
+        if self.peek().kind == "OP" and self.peek().value == "(":
+            self.advance()
+            name, loc, inner = self._parse_declarator()
+            self.expect("OP", ")")
+            sizes = self._parse_array_suffixes()
+            def wrap(base, inner=inner, sizes=sizes):
+                t = base
+                for n in reversed(sizes):
+                    t = Type.array(t, n)
+                return inner(t)
+            return name, loc, wrap
         if self.peek().kind != "IDENT":
             raise CParseError(self.peek().line, self.peek().col, "expected identifier")
         name = self.advance().value
-        name_loc = self._loc(self.toks[self.i-1])
+        loc = self._loc(self.toks[self.i-1])
+        sizes = self._parse_array_suffixes()
+        def wrap(base, ptrs=ptrs, sizes=sizes):
+            t = base
+            for _ in range(ptrs):
+                t = Type.pointer(t)
+            for n in reversed(sizes):
+                t = Type.array(t, n)
+            return t
+        return name, loc, wrap
 
-        # Handle array declarators (e.g., [10])
-        array_size = None
-        if self.peek().kind == "OP" and self.peek().value == "[":
-            self.advance()  # consume [
-            if self.peek().kind == "INT_LIT":
-                array_size = self.advance().value
-            else:
-                # Variable length array - for now just accept empty []
-                pass
-            self.expect("OP", "]")
-
-        # Build the type with pointer/array modifiers
-        ty = base_type
-        if array_size is not None:
-            ty = ("Array", array_size, ty)
-        for _ in range(ptr_level):
-            ty = ("Pointer", ty)
-
-        return (ty, name, name_loc)
+    def parse_declarator(self, base_type):
+        name, loc, wrap = self._parse_declarator()
+        return (wrap(base_type), name, loc)
 
     def parse_param(self):
         ty = self.parse_type()
-        return self.parse_declarator(ty)
+        name, loc, wrap = self._parse_declarator()
+        pty = wrap(ty)
+        # An array parameter decays to a pointer to its element type.
+        if pty.kind == "array":
+            pty = Type.pointer(pty.elem)
+        return (pty, name, loc)
+
+    def _parse_init(self):
+        """Parse the initialiser of a declaration: an expression or a list."""
+        if self.peek().kind == "OP" and self.peek().value == "{":
+            self.advance()
+            items = []
+            if not (self.peek().kind == "OP" and self.peek().value == "}"):
+                items.append(self.parse_expr())
+                while self.peek().kind == "OP" and self.peek().value == ",":
+                    self.advance()
+                    if self.peek().kind == "OP" and self.peek().value == "}":
+                        break
+                    items.append(self.parse_expr())
+            self.expect("OP", "}")
+            return ("InitList", items)
+        return self.parse_expr()
 
     def parse_block(self):
         self.expect("OP", "{")
@@ -156,7 +199,7 @@ class Parser:
             init = None
             if self.peek().kind == "OP" and self.peek().value == "=":
                 self.advance()
-                init = self.parse_expr()
+                init = self._parse_init()
             decls.append(("VarDecl", ty, name, init, name_loc))
             if self.peek().kind == "OP" and self.peek().value == ",":
                 self.advance()

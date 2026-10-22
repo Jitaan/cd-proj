@@ -22,10 +22,21 @@ class RunResult:
 def run_program(prog, inputs=None, max_steps=1_000_000, max_depth=1000):
     if inputs is None: inputs = []
     from ir.tac import eval_binary, eval_unary, wrap, uses, defs
+    from ir.program import default_value, is_array_type
     inp_idx = [0]
     globals_ = {name: (ty, val) for name, (ty, val) in prog.globals.items()}
-    gvals = {name: val for name, (ty, val) in prog.globals.items()}
     gtypes = {name: ty for name, (ty, val) in prog.globals.items()}
+    gvals = {}
+    for name, (ty, val) in prog.globals.items():
+        if is_array_type(ty):
+            arr = default_value(ty)
+            if isinstance(val, list):
+                n = ty.count or 0
+                for i in range(min(n, len(val))):
+                    arr[i] = val[i]
+            gvals[name] = arr
+        else:
+            gvals[name] = val
 
     result = RunResult()
     # frame-based execution
@@ -44,10 +55,8 @@ def run_program(prog, inputs=None, max_steps=1_000_000, max_depth=1000):
             locals_[pname] = (pty, aval)
         for v, ty in fn.var_types.items():
             if v not in locals_:
-                # Check if it's an array type (e.g., "array10")
-                if isinstance(ty, str) and ty.startswith("array"):
-                    size = int(ty[5:])  # extract size from "arrayN"
-                    locals_[v] = (ty, [0] * size)
+                if is_array_type(ty):
+                    locals_[v] = (ty, default_value(ty))
                 else:
                     locals_[v] = (ty, None)  # uninitialized
         return {"fn": fn, "pc": 0, "locals": locals_, "ret": None}
@@ -72,8 +81,10 @@ def run_program(prog, inputs=None, max_steps=1_000_000, max_depth=1000):
             if operand in gvals:
                 return gvals[operand]
             # Identifiers that are not declared are errors; anything else
-            # (e.g. a printf format string) is a literal.
-            if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', operand):
+            # (e.g. a printf format string) is a literal.  fullmatch, not
+            # match: `$` would let a trailing newline through and make the
+            # format string "ok\n" look like an identifier.
+            if re.fullmatch(r'[a-zA-Z_][a-zA-Z0-9_]*', operand):
                 raise RuntimeError("undefined_var")
             return operand
         return operand
@@ -81,9 +92,9 @@ def run_program(prog, inputs=None, max_steps=1_000_000, max_depth=1000):
     def set_val(frame, name, val, ty=None):
         if name in frame["locals"]:
             t = frame["locals"][name][0]
-            frame["locals"][name] = (t, wrap(val, t) if t else val)
+            frame["locals"][name] = (t, _wrap_value(val, t))
         elif name in gvals:
-            gvals[name] = wrap(val, gtypes[name])
+            gvals[name] = _wrap_value(val, gtypes[name])
         else:
             frame["locals"][name] = (ty or "i32", val)
 
@@ -97,7 +108,7 @@ def run_program(prog, inputs=None, max_steps=1_000_000, max_depth=1000):
             ty, val = gtypes[base], gvals[base]
         else:
             raise RuntimeError("unknown array '%s'" % base)
-        if not (isinstance(ty, str) and ty.startswith("array")) or not isinstance(val, list):
+        if not isinstance(val, list):
             raise RuntimeError("'%s' is not an array" % base)
         return ty, val
 
@@ -329,9 +340,25 @@ def run_program(prog, inputs=None, max_steps=1_000_000, max_depth=1000):
     return result
 
 
+def _wrap_value(val, ty):
+    """Store `val` in a slot of type `ty`, wrapping integers to its width."""
+    if not isinstance(val, int) or isinstance(val, bool):
+        return val
+    kind = getattr(ty, "kind", None)
+    if kind in ("scalar", "pointer"):
+        from ir.tac import wrap
+        return wrap(val, ty)
+    if kind is None and isinstance(ty, str):
+        from ir.tac import wrap
+        return wrap(val, ty)
+    return val
+
+
 def _format_val(v, spec, ty):
     # spec like "d", "u", "c", "x", "02d", etc.
     # handle width/zero flag
+    from ir.tac import _bits_signed
+    bits, _signed = _bits_signed(ty)
     zero = spec.startswith("0")
     # extract width
     width_str = "".join(ch for ch in spec if ch.isdigit())
@@ -343,14 +370,13 @@ def _format_val(v, spec, ty):
             return ch.rjust(width)
         return ch
     if base_spec in ("x", "X"):
-        mask = (1 << (int(ty[1:]) if ty[1:].isdigit() else 32)) - 1
+        mask = (1 << bits) - 1
         val = v & mask
         s = format(val, "x" if base_spec == "x" else "X")
         if width:
             s = s.rjust(width, "0" if zero else " ")
         return s
     if base_spec == "u":
-        bits = int(ty[1:]) if ty[1:].isdigit() else 32
         mask = (1 << bits) - 1
         val = v & mask
         s = str(val)

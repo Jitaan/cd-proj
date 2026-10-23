@@ -3,7 +3,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from frontend.c_types import (Type, common_type, VOID, type_from_tag,
-                              layout_record)
+                              layout_record, member_of)
 from frontend.errors import SemanticError, UnsupportedFeatureError
 
 __all__ = ["SemanticError", "UnsupportedFeatureError", "Sema", "analyze"]
@@ -26,6 +26,16 @@ def _strip_loc(node):
         if isinstance(last, tuple) and len(last) == 2 and all(isinstance(x, int) for x in last):
             return node[:-1]
     return node
+
+
+def _is_lvalue(node):
+    """True for an expression that designates storage (after annotation)."""
+    if not isinstance(node, tuple) or not node:
+        return False
+    kind = node[0]
+    if kind in ("Ident", "Index", "Member", "Arrow"):
+        return True
+    return kind == "Unary" and node[1] == "*"
 
 
 class Sema:
@@ -109,10 +119,10 @@ class Sema:
                     return ("Unary", op, e), et.elem
                 raise SemanticError(loc[0], loc[1], "dereference of non-pointer")
             if op == "&":
-                # address-of: &arr is a pointer to the whole array
-                if et is not None and et.kind == "array":
-                    return ("Unary", op, e), Type.pointer(et)
-                if isinstance(et, Type) and et.kind != "void":
+                # address-of: only valid on an lvalue.  &arr is a pointer to the
+                # whole array; &x a pointer to x (or to a dereferenced/indexed
+                # or member lvalue).
+                if et is not None and _is_lvalue(e):
                     return ("Unary", op, e), Type.pointer(et)
                 raise SemanticError(loc[0], loc[1], "address-of non-lvalue")
             return ("Unary", op, e), et
@@ -139,16 +149,34 @@ class Sema:
         if kind == "BinOp":
             l, lt = self.annotate_expr(node[2])
             r, rt = self.annotate_expr(node[3])
+            op = node[1]
             if lt is None or rt is None:
-                return ("BinOp", node[1], l, r), Type("scalar", bits=32, signed=True)
-            if node[1] in ("&&", "||"):
-                return ("BinOp", node[1], l, r), Type("scalar", bits=32, signed=True)
-            if node[1] in ("<<", ">>"):
-                return ("BinOp", node[1], l, r), lt
-            if node[1] in ("<", ">", "<=", ">=", "==", "!="):
-                return ("BinOp", node[1], l, r), Type("scalar", bits=32, signed=True)
+                return ("BinOp", op, l, r), Type("scalar", bits=32, signed=True)
+            if op in ("&&", "||"):
+                return ("BinOp", op, l, r), Type("scalar", bits=32, signed=True)
+            if op in ("<<", ">>"):
+                return ("BinOp", op, l, r), lt
+            if op in ("<", ">", "<=", ">=", "==", "!="):
+                return ("BinOp", op, l, r), Type("scalar", bits=32, signed=True)
+            ld = lt.decay()
+            rd = rt.decay()
+            if ld.kind == "pointer" or rd.kind == "pointer":
+                if op in ("+", "-"):
+                    if ld.kind == "pointer" and rd.kind == "pointer":
+                        if op == "-":
+                            # pointer difference: a signed element count
+                            return ("BinOp", op, l, r), Type("scalar", bits=64, signed=True)
+                        raise SemanticError(loc[0], loc[1], "cannot add two pointers")
+                    ptr = ld if ld.kind == "pointer" else rd
+                    other = rd if ld.kind == "pointer" else ld
+                    if other.kind != "scalar":
+                        raise SemanticError(loc[0], loc[1], "invalid pointer arithmetic")
+                    if ptr.pointee is None or ptr.pointee.kind == "void":
+                        raise SemanticError(loc[0], loc[1], "arithmetic on void pointer")
+                    return ("BinOp", op, l, r), ptr
+                raise SemanticError(loc[0], loc[1], "invalid operator %s on pointer" % op)
             ct = common_type(lt, rt)
-            return ("BinOp", node[1], l, r), ct
+            return ("BinOp", op, l, r), ct
         if kind == "Ternary":
             c, ct = self.annotate_expr(node[1])
             t, tt = self.annotate_expr(node[2])
@@ -179,16 +207,28 @@ class Sema:
                 return ("Index", base, idx), bt.pointee
             raise SemanticError(loc[0], loc[1], "subscripted value is not an array or pointer")
         if kind == "Arrow":
-            # ptr->member
+            # ptr->member : base must be a pointer to a record
             base, bt = self.annotate_expr(node[1])
-            member = node[2]
-            if bt is not None and bt.kind == "pointer":
-                return ("Arrow", base, member), bt.pointee
-            raise SemanticError(loc[0], loc[1], "arrow on non-pointer")
+            if bt is None or bt.kind != "pointer" or bt.pointee is None \
+                    or bt.pointee.kind != "record":
+                raise SemanticError(loc[0], loc[1], "arrow on non-pointer-to-record")
+            m = member_of(bt.pointee, node[2], loc[0], loc[1])
+            return ("Arrow", base, m.name, m.offset, m.type), m.type
         if kind == "Member":
-            # obj.member -- needs a record type, which the front end does not
-            # build yet.
-            raise UnsupportedFeatureError("record member access", loc[0], loc[1])
+            # obj.member : base must be a record
+            base, bt = self.annotate_expr(node[1])
+            if bt is None or bt.kind != "record":
+                raise SemanticError(loc[0], loc[1], "member access on non-record type")
+            m = member_of(bt, node[2], loc[0], loc[1])
+            return ("Member", base, m.name, m.offset, m.type), m.type
+        if kind == "UnaryAssign":
+            # `*p = v` / `&x = v` statement forms from parse_simple_stmt
+            lhs, lty = self.annotate_expr(_strip_loc(node[2]))
+            rhs, rty = self.annotate_expr(node[4])
+            return ("Assign", node[3], lhs, rhs), (rty or lty or Type("scalar", bits=32, signed=True))
+        if kind == "UnaryIncDec":
+            base, bt = self.annotate_expr(_strip_loc(node[3]))
+            return ("IncDec", node[1], node[2], base), bt
         return node, Type("scalar", bits=32, signed=True)
 
     def analyze_decl(self, node, is_global=False):
@@ -199,8 +239,9 @@ class Sema:
         uniq = self.declare(name, ty, loc[0], loc[1], is_global=is_global)
         init = node[3]
         if init is not None and init[0] == "InitList":
-            ty = self._complete_type(ty, init, loc)
-            self.scopes[-1][name] = (uniq, ty)
+            if ty.kind == "array":
+                ty = self._complete_type(ty, init, loc)
+                self.scopes[-1][name] = (uniq, ty)
             items = [self.annotate_expr(e)[0] for e in init[1]]
             return ("VarDecl", ty, uniq, ("InitList", items))
         if init is not None:
@@ -323,7 +364,8 @@ class Sema:
                 loc = _get_loc(d)
                 init = d[3]
                 if init is not None and init[0] == "InitList":
-                    ty = self._complete_type(ty, init, loc)
+                    if ty.kind == "array":
+                        ty = self._complete_type(ty, init, loc)
                     items = [self.annotate_expr(e)[0] for e in init[1]]
                     init = ("InitList", items)
                 elif init is not None:

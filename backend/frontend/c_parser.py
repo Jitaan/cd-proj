@@ -4,7 +4,12 @@ sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from c_lexer import lex_c, CToken, CLexError
 from preprocess import PreprocessError
-from frontend.c_types import Type, parse_type_specifiers
+from frontend.c_types import Type, parse_type_specifiers, layout_record
+
+# Keywords that can begin a type specifier.
+_TYPE_START = ("const", "char", "short", "int", "long", "unsigned", "signed",
+               "void", "struct", "union")
+_SCALAR_SPECS = ("const", "char", "short", "int", "long", "unsigned", "signed", "void")
 
 class CParseError(Exception):
     def __init__(self, line, col, msg):
@@ -14,6 +19,7 @@ class CParseError(Exception):
 class Parser:
     def __init__(self, toks):
         self.toks = toks; self.i = 0
+        self.record_tags = {}  # tag name -> Type (record)
     def peek(self):
         return self.toks[self.i] if self.i < len(self.toks) else self.toks[-1]
     def advance(self):
@@ -30,7 +36,7 @@ class Parser:
     def parse_translation_unit(self):
         decls = []
         while self.peek().kind != "EOF":
-            if self.peek().kind == "KEYWORD" and self.peek().value in ("struct","enum","typedef","switch","goto"):
+            if self.peek().kind == "KEYWORD" and self.peek().value in ("enum","typedef","switch","goto"):
                 raise CParseError(self.peek().line, self.peek().col, "unsupported feature: %s" % self.peek().value)
             # function or one or more global variables
             d = self.parse_top_level()
@@ -43,6 +49,10 @@ class Parser:
     def parse_top_level(self):
         # type + name
         ty = self.parse_type()
+        # a bare struct/union definition with no declarator: `struct P { ... };`
+        if self.peek().kind == "OP" and self.peek().value == ";":
+            self.advance()
+            return []
         is_func = (self.peek().kind == "IDENT"
                    and self.i + 1 < len(self.toks)
                    and self.toks[self.i + 1].kind == "OP"
@@ -80,12 +90,66 @@ class Parser:
         return decls
 
     def parse_type(self):
+        if self.peek().kind == "KEYWORD" and self.peek().value in ("struct", "union"):
+            return self.parse_struct_or_union_specifier()
         specs = []
-        while self.peek().kind == "KEYWORD" and self.peek().value in ("const","char","short","int","long","unsigned","signed","void"):
+        while self.peek().kind == "KEYWORD" and self.peek().value in _SCALAR_SPECS:
             specs.append(self.advance().value)
         if not specs:
             raise CParseError(self.peek().line, self.peek().col, "expected type")
         return parse_type_specifiers(specs)
+
+    def parse_struct_or_union_specifier(self):
+        """Parse a `struct`/`union` type specifier (with or without a body).
+
+        Definitions are laid out with natural alignment.  A tag is registered
+        before its members are parsed so a struct may refer to itself through a
+        pointer (`struct Node { int v; struct Node *next; }`).
+        """
+        kw_tok = self.advance()
+        is_union = (kw_tok.value == "union")
+        tag = None
+        if self.peek().kind == "IDENT":
+            tag = self.advance().value
+        if self.peek().kind == "OP" and self.peek().value == "{":
+            rec = self.record_tags.get(tag) if tag is not None else None
+            if rec is None:
+                rec = Type("record", name=tag, is_union=is_union)
+                if tag is not None:
+                    self.record_tags[tag] = rec
+            self.advance()  # {
+            pairs = self._parse_members()
+            self.expect("OP", "}")
+            layout = layout_record(tag, pairs, is_union=is_union)
+            rec.members = layout.members
+            rec._size = layout._size
+            rec._align = layout._align
+            return rec
+        if tag is None:
+            raise CParseError(kw_tok.line, kw_tok.col, "expected struct/union tag or body")
+        rec = self.record_tags.get(tag)
+        if rec is None:
+            # forward declaration (completed later)
+            rec = Type("record", name=tag, is_union=is_union)
+            self.record_tags[tag] = rec
+        return rec
+
+    def _parse_members(self):
+        """Parse a struct/union member list into (name, Type) pairs."""
+        pairs = []
+        while not (self.peek().kind == "OP" and self.peek().value == "}"):
+            if self.peek().kind == "EOF":
+                raise CParseError(self.peek().line, self.peek().col, "expected }")
+            base = self.parse_type()
+            while True:
+                mty, mname, _mloc = self.parse_declarator(base)
+                pairs.append((mname, mty))
+                if self.peek().kind == "OP" and self.peek().value == ",":
+                    self.advance()
+                    continue
+                break
+            self.expect("OP", ";")
+        return pairs
 
     def _parse_array_suffixes(self):
         """Parse the `[n]` suffixes of a declarator, outermost first."""
@@ -182,7 +246,7 @@ class Parser:
 
     def parse_stmt_or_decl(self):
         # declaration if next is type keyword
-        if self.peek().kind == "KEYWORD" and self.peek().value in ("const","char","short","int","long","unsigned","signed","void"):
+        if self.peek().kind == "KEYWORD" and self.peek().value in _TYPE_START:
             return self.parse_decl()
         return self.parse_stmt()
 
@@ -194,6 +258,11 @@ class Parser:
         """
         base_ty = self.parse_type()
         decls = []
+        if self.peek().kind == "OP" and self.peek().value == ";":
+            # a type with no declarators (e.g. a bare struct definition)
+            if consume_semicolon:
+                self.advance()
+            return decls
         while True:
             ty, name, name_loc = self.parse_declarator(base_ty)
             init = None
@@ -247,7 +316,7 @@ class Parser:
             init = None
             # parse init
             if not (self.peek().kind == "OP" and self.peek().value == ";"):
-                if self.peek().kind == "KEYWORD" and self.peek().value in ("const","char","short","int","long","unsigned","signed","void"):
+                if self.peek().kind == "KEYWORD" and self.peek().value in _TYPE_START:
                     decls = self.parse_decl(consume_semicolon=False)
                     init = decls[0] if len(decls) == 1 else ("VarDecls", decls)
                 else:
@@ -480,7 +549,7 @@ class Parser:
             # could be cast or parenthesized expr
             saved = self.i
             self.advance()
-            if self.peek().kind == "KEYWORD" and self.peek().value in ("char","short","int","long","unsigned","signed","void","const"):
+            if self.peek().kind == "KEYWORD" and self.peek().value in _TYPE_START:
                 ty = self.parse_type()
                 self.expect("OP", ")")
                 e = self.parse_cast(stop_tokens)

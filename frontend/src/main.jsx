@@ -17,6 +17,22 @@ function Card({ title, children, className = "" }) {
   );
 }
 
+function formatValue(v) {
+  if (typeof v === "number" && !Number.isInteger(v)) return v.toFixed(4);
+  return String(v);
+}
+
+// trace entries are [round, pass, changed]; group by round and keep the
+// names of the passes that actually modified the TAC that round.
+function buildTraceRounds(trace) {
+  const rounds = new Map();
+  for (const [rnd, pass, changed] of trace) {
+    if (!rounds.has(rnd)) rounds.set(rnd, []);
+    if (changed) rounds.get(rnd).push(pass);
+  }
+  return [...rounds.entries()].sort((a, b) => a[0] - b[0]);
+}
+
 function App() {
   const [examples, setExamples] = useState({});
   const [source, setSource] = useState("");
@@ -71,11 +87,15 @@ function App() {
         ["Output after", (result.output_after || []).join("\n")],
         ["TAC before", (result.tac_before || []).join("\n")],
         ["TAC after", (result.tac_after || []).join("\n")],
-        ["Features", JSON.stringify(result.features, null, 2)],
         ["Passes run", (result.passes_run || []).join(", ")],
-        ["Trace", JSON.stringify(result.trace)],
       ]
     : [];
+
+  const featureRows = result && result.features ? Object.entries(result.features) : [];
+  const traceRounds =
+    result && Array.isArray(result.trace) && result.trace.length
+      ? buildTraceRounds(result.trace)
+      : [];
 
   return (
     <div className="flex min-h-screen flex-col bg-background text-foreground">
@@ -200,6 +220,60 @@ function App() {
                       </pre>
                     </Card>
                   ))}
+                  {result.features && (
+                    <Card title="Features">
+                      {featureRows.length > 0 ? (
+                        <table className="w-full text-xs">
+                          <tbody className="divide-y divide-border">
+                            {featureRows.map(([k, v]) => (
+                              <tr key={k}>
+                                <td className="py-1 pr-3 font-mono text-muted-foreground">{k}</td>
+                                <td className="py-1 text-right font-mono text-foreground">
+                                  {formatValue(v)}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      ) : (
+                        <p className="text-xs text-muted-foreground">No features available.</p>
+                      )}
+                    </Card>
+                  )}
+                  {Array.isArray(result.trace) && (
+                    <Card title="Pass trace">
+                      {traceRounds.length > 0 ? (
+                        <table className="w-full text-xs">
+                          <thead>
+                            <tr className="text-left text-muted-foreground">
+                              <th className="w-14 pb-1 font-medium">Round</th>
+                              <th className="pb-1 font-medium">Passes that changed the TAC</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-border">
+                            {traceRounds.map(([rnd, changed]) => (
+                              <tr key={rnd} className="align-top">
+                                <td className="py-1 pr-3 font-mono text-muted-foreground">{rnd}</td>
+                                <td className="py-1 font-mono text-foreground">
+                                  {changed.length ? (
+                                    changed.join(", ")
+                                  ) : (
+                                    <span className="text-muted-foreground">
+                                      no changes (converged)
+                                    </span>
+                                  )}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      ) : (
+                        <p className="text-xs text-muted-foreground">
+                          No optimization passes were run.
+                        </p>
+                      )}
+                    </Card>
+                  )}
                 </div>
               </>
             )}
